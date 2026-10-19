@@ -12,8 +12,8 @@ pytest.importorskip("tkinter")
 import tkinter as tk
 
 import pinclip
-from pinclip import (Card, ClipStore, FlatButton, IconButton, PinClipApp, fit_geometry,
-                     preview, stripe_color)
+from pinclip import (Card, ClipStore, FlatButton, IconButton, PinClipApp, edge_scroll_step,
+                     fit_geometry, preview, stripe_color)
 
 
 # ---- 純邏輯 ----------------------------------------------------------------
@@ -154,6 +154,19 @@ DUAL = (-1920, 0, 3840, 1080)       # 副螢幕在左邊，虛擬桌面從 -1920
 ])
 def test_fit_geometry(geometry, screen, expected):
     assert fit_geometry(geometry, *screen) == expected
+
+
+@pytest.mark.parametrize("y, expected", [
+    (150, 0),                     # 列表中間：不捲
+    (32, 0), (200 - 32, 0),       # 剛好在邊緣區外面
+    (31, -1), (169, 1),           # 剛進入邊緣區：只捲 1 像素
+    (16, -2), (184, 2),           # 在邊緣區中間
+    (0, -5), (200, 5),            # 在列表邊緣上
+    (-32, -10), (-500, -10),      # 拖到列表外：最快，而且有上限
+    (232, 10), (900, 10),
+])
+def test_edge_scroll_step(y, expected):
+    assert edge_scroll_step(y, 200, 32, 10) == expected
 
 
 def test_custom_frame_choice(monkeypatch):
@@ -458,6 +471,70 @@ def test_dragging_near_the_bottom_edge_scrolls_the_list(app):
     app._card_release(None)
     assert app.store.items.index("項目 00") > 0
     assert app._autoscroll_job is None
+
+
+def start_drag_at_the_bottom_edge(app):
+    """抓住畫面上最後一張卡片、游標移到列表下緣附近（還沒放開），回傳 (卡片, 原本的位置)。"""
+    app.store.items = [f"項目 {i:02d}" for i in range(30)]
+    app.refresh()
+    app.root.update()
+    bottom = app.canvas.winfo_rooty() + app.canvas.winfo_height()
+    card = [c for c in app._cards if c.winfo_rooty() + c.winfo_height() <= bottom][-1]
+    index = app._cards.index(card)
+    top = card.winfo_rooty() + 10
+    app._card_press(event(x_root=100, y_root=top))
+    near_edge = bottom - 12
+    app.canvas.winfo_pointery = lambda: near_edge
+    app._card_motion(event(x_root=100, y_root=near_edge), card)
+    return card, index
+
+
+def run_for(app, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        app.root.update()
+        time.sleep(0.01)
+
+
+def test_passing_through_the_edge_does_not_scroll(app):
+    start_drag_at_the_bottom_edge(app)
+    run_for(app, 0.25)                                    # 還沒停夠久
+    assert app.canvas.canvasy(0) == 0
+    app._card_release(None)
+
+
+def test_edge_scrolling_is_slow_enough_not_to_rush_to_the_bottom(app):
+    """回歸：游標只是移到列表下緣，整個列表曾經每秒衝 380 像素、卡片一路被推到最底。"""
+    card, index = start_drag_at_the_bottom_edge(app)
+    run_for(app, 1.5)
+    scrolled = app.canvas.canvasy(0)
+    assert 0 < scrolled < 150                             # 有在捲，但很慢
+    assert app._cards.index(card) - index <= 3            # 卡片只跟著往下走幾格
+    app._card_release(None)
+    assert app.store.items.index(card.text) == app._cards.index(card)
+
+
+def test_edge_scrolling_stops_when_the_pointer_leaves_the_edge(app):
+    start_drag_at_the_bottom_edge(app)
+    run_for(app, 0.9)
+    app.canvas.winfo_pointery = lambda: app.canvas.winfo_rooty() + app.canvas.winfo_height() // 2
+    run_for(app, 0.1)
+    stopped_at = app.canvas.canvasy(0)
+    run_for(app, 0.5)
+    assert app.canvas.canvasy(0) == stopped_at
+    app._card_release(None)
+
+
+def test_mouse_wheel_scrolls_the_list_by_a_fixed_amount(app):
+    app.store.items = [f"項目 {i:02d}" for i in range(30)]
+    app.refresh()
+    app.root.update()
+    app._on_wheel(event(widget=app.canvas, num=0, delta=-120))
+    app.root.update()
+    assert app.canvas.canvasy(0) == app.px(40)
+    app._on_wheel(event(widget=app.canvas, num=0, delta=120))
+    app.root.update()
+    assert app.canvas.canvasy(0) == 0
 
 
 def test_drag_with_real_mouse_events_on_the_handle(app):

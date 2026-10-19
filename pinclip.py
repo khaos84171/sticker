@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import traceback
 import zlib
 import tkinter as tk
@@ -98,6 +99,29 @@ def preview(text, max_lines=3, max_chars=140):
         shown = shown[:max_chars]
         truncated = True
     return shown + ("…" if truncated else "")
+
+
+# 拖曳排序時的邊緣自動捲動（像素以 96 DPI 計）
+EDGE_ZONE = 32          # 離列表上下緣多近算「在邊緣」
+EDGE_MAX_STEP = 10      # 游標在邊緣上或超出邊緣時，每次最多捲幾個像素
+EDGE_DELAY = 0.4        # 停在邊緣多久（秒）才開始捲
+AUTOSCROLL_MS = 30
+
+
+def edge_scroll_step(y, height, zone, max_step):
+    """游標在列表裡的高度 y（0 是列表上緣）→ 這一次要捲幾個像素：負的往上、正的往下、0 不捲。
+
+    剛進入邊緣區只捲 1 像素，到列表邊緣上約一半速度，游標拖出列表外才到最快。
+    """
+    if y < zone:
+        depth = (zone - y) / zone
+        sign = -1
+    elif y > height - zone:
+        depth = (y - (height - zone)) / zone
+        sign = 1
+    else:
+        return 0
+    return sign * max(1, round(min(depth, 2.0) * max_step / 2))
 
 
 def stripe_color(text):
@@ -401,6 +425,7 @@ class PinClipApp:
         self._press_pos = None      # 按下卡片的位置；移動超過幾個像素才算拖曳
         self._drag_card = None      # 正在被拖曳排序的卡片
         self._autoscroll_job = None
+        self._edge_since = None     # 游標開始停在列表邊緣的時間
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self.min_w, self.min_h = self.px(MIN_SIZE[0]), self.px(MIN_SIZE[1])
@@ -513,8 +538,10 @@ class PinClipApp:
 
         area = tk.Frame(self.body, bg=BG)
         area.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(area, bg=BG, highlightthickness=0, bd=0,
-                                yscrollincrement=P(20), yscrollcommand=self._on_yview)
+        # yscrollincrement=1：捲動單位是 1 像素。設成更大的值時，Tk 會把位置湊成它的倍數，
+        # 自動捲動每次只捲幾個像素就會被湊回原位而完全不動。
+        self.canvas = tk.Canvas(area, bg=BG, highlightthickness=0, bd=0, yscrollincrement=1,
+                                yscrollcommand=self._on_yview)
         self.canvas.pack(fill="both", expand=True)
         # 捲軸浮在右邊，要不要顯示都不會改變卡片寬度
         self.scroll = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview,
@@ -701,25 +728,45 @@ class PinClipApp:
         self.inner.update_idletasks()
 
     def _autoscroll(self):
-        """拖到列表上緣或下緣時，列表自己往那邊捲，這樣長列表也能拖到很遠的位置。"""
+        """拖到列表上緣或下緣時，列表慢慢往那邊捲，這樣長列表也能拖到很遠的位置。
+
+        游標要在邊緣停留一下才開始捲（路過不算），而且越靠近邊緣捲得越快，
+        否則把卡片往下拖一點點碰到邊緣，整個列表就會衝到最底。
+        """
         if self._drag_card is None:
             return
         pointer_y = self.canvas.winfo_pointery()
-        y = pointer_y - self.canvas.winfo_rooty()
-        zone = self.px(28)
-        before = self.canvas.yview()
-        if y < zone:
-            self.canvas.yview_scroll(-1, "units")
-        elif y > self.canvas.winfo_height() - zone:
-            self.canvas.yview_scroll(1, "units")
-        if self.canvas.yview() != before:
-            self._reorder_to(pointer_y)
-        self._autoscroll_job = self.root.after(50, self._autoscroll)
+        step = edge_scroll_step(pointer_y - self.canvas.winfo_rooty(),
+                                self.canvas.winfo_height(), self.px(EDGE_ZONE),
+                                self.px(EDGE_MAX_STEP))
+        now = time.monotonic()
+        if step == 0:
+            self._edge_since = None
+        else:
+            if self._edge_since is None:
+                self._edge_since = now
+            if now - self._edge_since >= EDGE_DELAY and self._scroll_by(step):
+                self._reorder_to(pointer_y)
+        self._autoscroll_job = self.root.after(AUTOSCROLL_MS, self._autoscroll)
+
+    def _scroll_by(self, pixels):
+        """列表往下捲 pixels 像素（負的是往上）。已經到頭了就回傳 False。"""
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return False
+        total, view = bbox[3] - bbox[1], self.canvas.winfo_height()
+        top = self.canvas.canvasy(0)
+        target = max(0, min(total - view, top + pixels))
+        if total <= view or target == top:
+            return False
+        self.canvas.yview_moveto(target / total)
+        return True
 
     def _stop_drag(self):
         if self._autoscroll_job is not None:
             self.root.after_cancel(self._autoscroll_job)
             self._autoscroll_job = None
+        self._edge_since = None
         self._drag_card = None
         self._press_pos = None
 
@@ -775,7 +822,7 @@ class PinClipApp:
             step = 1
         else:
             step = -1 if event.delta > 0 else 1
-        self.canvas.yview_scroll(step * 2, "units")
+        self.canvas.yview_scroll(step * self.px(40), "units")      # 滾輪每格 40 像素
 
     # ---- 視窗：釘選、縮小、移動、調整大小 ---------------------------------
 
