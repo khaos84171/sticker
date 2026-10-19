@@ -281,8 +281,6 @@ def draw_icon(canvas, name, ox, oy, size, color, fill, width):
 
     if name == "minus":
         line((3, 8), (13, 8))
-    elif name == "square":
-        rect(3.5, 3.5, 12.5, 12.5)
     elif name == "close":
         line((4, 4), (12, 12))
         line((12, 4), (4, 12))
@@ -437,7 +435,8 @@ class PinClipApp:
         self.store = store
         self.custom_frame = custom_frame
         self.pinned = store.window.get("pinned", True) is not False
-        self.collapsed = False
+        self._minimized = False     # 無外框視窗縮到工作列期間為 True（見 minimize）
+        self._saved_geometry = ""
         self._undo = None
         self._status_job = None
         self._labels = []
@@ -468,13 +467,13 @@ class PinClipApp:
             default="%dx%d" % (self.px(DEFAULT_SIZE[0]), self.px(DEFAULT_SIZE[1])),
             min_size=(self.min_w, self.min_h))
         root.geometry(geometry)
-        self._expanded_height = int(geometry.split("x")[1].split("+")[0])
         root.report_callback_exception = self._on_callback_error
         root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build_ui()
         if custom_frame:
             self._bind_edges()
+            root.bind("<Map>", self._on_map, add="+")
         self.apply_pin()
         self.refresh()
         if store.save_failed:
@@ -593,15 +592,14 @@ class PinClipApp:
         self.close_button = header_button("close", self.close)
         self.close_button.set_colors(HEADER_MUTED, HEADER, HEADER_FG, CLOSE_HOVER)
         self.close_button.pack(side="right", fill="y")
-        self.collapse_button = header_button("minus", self.toggle_collapse)
-        self.collapse_button.pack(side="right", fill="y")
+        self.minimize_button = header_button("minus", self.minimize)
+        self.minimize_button.pack(side="right", fill="y")
         self.pin_button = IconButton(self.header, "pin", self.toggle_pin, width=P(30),
                                      height=P(30), icon_size=P(16), fg=PIN_ON_FG, bg=PIN_ON_BG,
                                      surface=HEADER, radius=P(9), line=1.5 * self.scale)
         self.pin_button.pack(side="right", padx=P(6), pady=P(4))
-        for widget in (self.header, title):
-            widget.bind("<Double-Button-1>", lambda e: self.toggle_collapse())
-            if self.custom_frame:       # 沒有系統標題列時，拖這一條來移動視窗
+        if self.custom_frame:           # 沒有系統標題列時，拖這一條來移動視窗
+            for widget in (self.header, title):
                 widget.bind("<ButtonPress-1>", self._drag_start)
                 widget.bind("<B1-Motion>", self._drag_move)
 
@@ -846,7 +844,7 @@ class PinClipApp:
             step = -1 if event.delta > 0 else 1
         self.canvas.yview_scroll(step * self.px(40), "units")      # 滾輪每格 40 像素
 
-    # ---- 視窗：釘選、縮小、移動、調整大小 ---------------------------------
+    # ---- 視窗：釘選、最小化、移動、調整大小 -------------------------------
 
     def apply_pin(self):
         self.root.attributes("-topmost", self.pinned)
@@ -861,31 +859,39 @@ class PinClipApp:
         self.pinned = not self.pinned
         self.apply_pin()
 
-    def toggle_collapse(self):
-        """縮小：只剩標題列（還是釘在最上層）；再按一次還原。"""
+    def minimize(self):
+        """縮到工作列，跟一般視窗一樣；從工作列點一下就還原。"""
         root = self.root
-        if not self.collapsed:
-            if root.winfo_ismapped():
-                self._expanded_height = root.winfo_height()
-            self.body.pack_forget()
-            root.update_idletasks()
-            height = self.header.winfo_reqheight() + 2 * self._border
-            root.minsize(self.min_w, height)
-            root.geometry(f"{root.winfo_width()}x{height}")
-            root.resizable(True, False)
-            self.collapse_button.icon = "square"
-            if self.custom_frame:
-                self.grip.pack_forget()
-        else:
-            root.resizable(True, True)
-            root.minsize(self.min_w, self.min_h)
-            root.geometry(f"{root.winfo_width()}x{self._expanded_height}")
-            self.body.pack(fill="both", expand=True)
-            self.collapse_button.icon = "minus"
-            if self.custom_frame:
-                self.grip.pack(side="right")
-        self.collapse_button.set_colors(*self.collapse_button._colors)       # 重畫
-        self.collapsed = not self.collapsed
+        if self.custom_frame:
+            # 無外框（overrideredirect）的視窗沒辦法最小化：先換回有外框的狀態再縮下去，
+            # 等使用者從工作列點開時（見 _on_map）再換回無外框。
+            self._minimized = True
+            self._saved_geometry = root.geometry()
+            self._set_borderless(False)
+        root.iconify()
+
+    def _set_borderless(self, borderless):
+        """換成無外框／有外框。X11 上要先把視窗藏起來、換好再顯示才會生效；Windows 直接換就行。"""
+        root = self.root
+        if sys.platform != "win32":
+            root.withdraw()
+        root.update_idletasks()
+        root.overrideredirect(borderless)
+
+    def _on_map(self, event):
+        """視窗被顯示出來。如果是從工作列還原的，換回無外框。"""
+        if event.widget is not self.root or not self._minimized:
+            return
+        if self.root.state() == "iconic":
+            return          # 換成有外框時 Tk 也會送一次 Map，那不是還原
+        self._minimized = False
+        root = self.root
+        self._set_borderless(True)
+        root.deiconify()
+        root.geometry(self._saved_geometry)     # 有外框和無外框的位置會差一個標題列，換回來要擺回原處
+        self.apply_pin()
+        if sys.platform == "win32":
+            root.after(30, self._show_in_taskbar)       # 換回無外框後，工作列按鈕要再補一次
 
     def _drag_start(self, event):
         self._drag = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
@@ -912,11 +918,8 @@ class PinClipApp:
     def _edge_zone(self, event):
         if event.widget is not self.root:
             return None
-        zone = edge_at(event.x, event.y, self.root.winfo_width(), self.root.winfo_height(),
+        return edge_at(event.x, event.y, self.root.winfo_width(), self.root.winfo_height(),
                        self._border, self.px(EDGE_CORNER))
-        if zone and self.collapsed:       # 縮小後高度固定，只能調寬度
-            zone = zone.replace("n", "").replace("s", "") or None
-        return zone
 
     def _set_edge_cursor(self, zone):
         if zone == self._edge_cursor:
@@ -975,8 +978,6 @@ class PinClipApp:
 
     def _end_resize(self):
         self._resize_drag = None
-        if not self.collapsed:
-            self._expanded_height = self.root.winfo_height()
 
     def _show_in_taskbar(self):
         """無外框的視窗預設不會出現在工作列；Windows 上補回去，沒釘選又被蓋住時才找得回來。"""
@@ -1054,17 +1055,11 @@ class PinClipApp:
         self._undo = None
         self.status.configure(text="", cursor="")
 
-    def _geometry_for_save(self):
-        geometry = self.root.geometry()
-        match = _GEOMETRY.match(geometry)
-        if self.collapsed and match and match.group(3) is not None:
-            return f"{match.group(1)}x{self._expanded_height}+{match.group(3)}+{match.group(4)}"
-        return geometry
-
     def close(self):
         self._stop_drag()
         self.root.update()      # 讓剛複製的內容留在系統剪貼簿
-        self.store.set_window(self._geometry_for_save(), self.pinned)
+        geometry = self._saved_geometry if self._minimized else self.root.geometry()
+        self.store.set_window(geometry, self.pinned)
         self.root.destroy()
 
     def _on_callback_error(self, exc, value, tb):

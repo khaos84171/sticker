@@ -2,6 +2,9 @@
 Linux 沒有螢幕時：xvfb-run -a python -m pytest
 """
 import json
+import os
+import shutil
+import subprocess
 import time
 from types import SimpleNamespace
 
@@ -561,7 +564,7 @@ def test_drag_with_real_mouse_events_on_the_handle(app):
     assert sorted(app.store.items) == ["a", "b", "c"]
 
 
-# ---- 釘選、縮小、關閉 -------------------------------------------------------
+# ---- 釘選、最小化、關閉 -----------------------------------------------------
 
 def test_pin_button_toggles_topmost_and_label(app):
     app.pin_button.invoke()
@@ -571,34 +574,128 @@ def test_pin_button_toggles_topmost_and_label(app):
     assert app.topmost_calls == [True, False, True]
 
 
-def test_collapse_shrinks_to_title_bar_and_restores(app):
-    before = app.root.winfo_height()
-    app.collapse_button.invoke()
+class WindowSpy:
+    """記錄視窗被叫了哪些「換外框」「縮到工作列」的動作。
+
+    測試環境沒有視窗管理員，真的 iconify 看不出效果，所以只記錄呼叫，
+    並讓測試決定 state() 回報什麼（iconic = 還縮在工作列、normal = 已經還原）。
+    """
+
+    def __init__(self, app, monkeypatch):
+        self.calls = []
+        self.state = "normal"
+        root = app.root
+        real_override = root.overrideredirect
+
+        def overrideredirect(*args):
+            if args:
+                self.calls.append(("overrideredirect", bool(args[0])))
+            return real_override(*args)
+
+        monkeypatch.setattr(root, "overrideredirect", overrideredirect)
+        monkeypatch.setattr(root, "iconify", lambda: self.calls.append(("iconify",)))
+        monkeypatch.setattr(root, "state", lambda *args: self.state)
+
+
+def test_minimize_button_is_a_plain_minus_icon_and_nothing_is_hidden(app):
+    assert app.minimize_button.icon == "minus"
+    assert not hasattr(app, "toggle_collapse") and not hasattr(app, "collapsed")
+    app.minimize_button.invoke()
     app.root.update()
-    assert app.collapsed and not app.body.winfo_ismapped()
-    assert app.root.winfo_height() == app.header.winfo_reqheight() + 2 * app._border
-    assert app.collapse_button.icon == "square"
-    app.collapse_button.invoke()
+    assert app.body.winfo_ismapped()                     # 不再把內容收起來、留一條標題列
+
+
+def test_minimize_with_system_frame_just_iconifies(tmp_path, monkeypatch):
+    native = build_app(tmp_path, False)
+    try:
+        spy = WindowSpy(native, monkeypatch)
+        native.minimize_button.invoke()
+        assert spy.calls == [("iconify",)]               # 系統外框的視窗本來就能最小化
+        assert native._minimized is False
+    finally:
+        destroy(native)
+
+
+def test_minimize_borderless_window_goes_to_the_taskbar_and_comes_back(custom_app, monkeypatch):
+    app = custom_app
+    app.root.geometry("333x444+120+60")
     app.root.update()
-    assert not app.collapsed and app.body.winfo_ismapped()
-    assert app.root.winfo_height() == before
-    assert app.collapse_button.icon == "minus"
+    spy = WindowSpy(app, monkeypatch)
+
+    app.minimize_button.invoke()
+    # 無外框的視窗不能直接最小化：先換回有外框，再縮到工作列
+    assert spy.calls == [("overrideredirect", False), ("iconify",)]
+    assert app._minimized is True
+
+    spy.state = "iconic"
+    app._on_map(event(widget=app.root))                  # 換外框時 Tk 也會送 Map，那不是還原
+    assert spy.calls == [("overrideredirect", False), ("iconify",)] and app._minimized is True
+
+    app.root.geometry("+140+110")                        # 有外框時位置會差一個標題列
+    spy.state = "normal"
+    app._on_map(event(widget=app.input))
+    assert app._minimized is True                        # 子元件的 Map 不算
+    app._on_map(event(widget=app.root))                  # 從工作列點開
+    assert spy.calls[-1] == ("overrideredirect", True) and app._minimized is False
+    app.root.update()
+    assert (app.root.winfo_x(), app.root.winfo_y()) == (120, 60)     # 擺回原本的位置
+    assert app.topmost_calls[-1] is True                              # 還是釘在最上層
+
+    app._on_map(event(widget=app.root))                  # 之後的 Map（一般顯示）不會再動外框
+    assert spy.calls[-1] == ("overrideredirect", True) and len(spy.calls) == 3
 
 
-def test_double_click_title_bar_collapses(app):
-    for _ in range(2):                  # Tk 不讓直接產生 Double 事件，連按兩次
-        app.header.event_generate("<ButtonPress-1>", x=5, y=5)
-        app.header.event_generate("<ButtonRelease-1>", x=5, y=5)
-    assert app.collapsed
+@pytest.mark.skipif(not shutil.which("openbox"), reason="需要 openbox（Linux 上模擬有視窗管理員的環境）")
+def test_minimize_and_restore_with_a_real_window_manager(tmp_path):
+    """用真的視窗管理員驗證：縮到工作列（iconic）、從工作列點開後換回無外框、位置還原。
+
+    沒有視窗管理員時 iconify 看不出效果；有的話曾發現「換外框後立刻 iconify」不會生效，
+    所以這個流程要在真的環境走一次。deiconify 代表從工作列點開。
+    """
+    if not os.environ.get("DISPLAY"):
+        pytest.skip("沒有顯示器")
+    wm = subprocess.Popen(["openbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    app = None
+    try:
+        time.sleep(1.0)
+        app = build_app(tmp_path, True)
+        root = app.root
+        root.geometry("340x480+120+60")
+        run_for(app, 0.5)
+
+        def wait_for(condition, timeout=3.0):
+            end = time.time() + timeout
+            while time.time() < end and not condition():
+                root.update()
+                time.sleep(0.02)
+            return condition()
+
+        app.minimize_button.invoke()
+        assert wait_for(lambda: root.state() == "iconic"), "沒有縮到工作列"
+        assert app._minimized is True
+
+        run_for(app, 0.5)                                   # 讓視窗管理員把縮下去的狀態處理完
+        root.deiconify()                                    # 從工作列點開
+        assert wait_for(lambda: root.state() == "normal" and not app._minimized), "沒有還原"
+        run_for(app, 0.3)
+        assert root.overrideredirect()                      # 又是無外框
+        assert (root.winfo_x(), root.winfo_y(), root.winfo_width(), root.winfo_height()) == (120, 60, 340, 480)
+    finally:
+        if app is not None:
+            destroy(app)
+        wm.terminate()
+        wm.wait(timeout=5)
 
 
-def test_closing_while_collapsed_remembers_the_full_height(app, tmp_path):
+def test_closing_from_the_taskbar_while_minimized_saves_the_normal_geometry(custom_app, monkeypatch, tmp_path):
+    app = custom_app
     app.root.geometry("333x444+20+30")
     app.root.update()
-    app.collapse_button.invoke()
-    app.root.update()
+    WindowSpy(app, monkeypatch)
+    app.minimize_button.invoke()
+    app.root.geometry("+500+500")                        # 縮到工作列期間的外框位置不要存進去
     app.close()
-    assert ClipStore(tmp_path / "pinclip.json").window["geometry"].startswith("333x444")
+    assert ClipStore(tmp_path / "pinclip.json").window["geometry"] == "333x444+20+30"
 
 
 def test_close_button_saves_state_and_closes_the_window(app, tmp_path):
@@ -660,7 +757,6 @@ def test_resize_grip_resizes_and_respects_minimum(custom_app):
     app.root.update()
     assert (app.root.winfo_width(), app.root.winfo_height()) == (app.min_w, app.min_h)
     app._end_resize()
-    assert app._expanded_height == app.min_h
 
 
 # ---- 拖曳邊框縮放（自繪標題列才有）-------------------------------------------
@@ -739,7 +835,6 @@ def test_drag_right_and_bottom_edges(custom_app):
     press_edge(app, 200, 498)(0, 30)
     assert shown_geometry(app)[2:] == (w + 50, h + 30)
     release(app)
-    assert app._expanded_height == h + 30
 
 
 def test_drag_top_edge_keeps_the_bottom_edge_in_place(custom_app):
@@ -771,24 +866,6 @@ def test_resizing_from_the_left_stops_at_the_minimum_without_moving_the_right_ed
     nx, ny, nw, nh = shown_geometry(app)
     assert nw == app.min_w and nx + nw == x + w                # 不能再窄，而且右邊界沒被推走
     release(app)
-
-
-def test_collapsed_window_can_only_be_resized_horizontally(custom_app):
-    app = custom_app
-    app.root.geometry("400x500+200+100")
-    app.root.update()
-    app.collapse_button.invoke()
-    app.root.update()
-    x, y, w, h = shown_geometry(app)
-    press_edge(app, 200, app.root.winfo_height() - 2)(0, 80)   # 下邊：縮小時高度固定
-    assert shown_geometry(app) == (x, y, w, h)
-    release(app)
-    press_edge(app, app.root.winfo_width() - 2, 20)(40, 0)     # 右邊：可以調寬度
-    assert shown_geometry(app) == (x, y, w + 40, h)
-    release(app)
-    app.collapse_button.invoke()                               # 還原後高度仍是縮小前的
-    app.root.update()
-    assert app.root.winfo_height() == 500
 
 
 def test_pressing_inside_the_window_does_not_resize(custom_app):
@@ -854,7 +931,7 @@ def test_flash_after_the_card_was_rebuilt_does_not_error(app, tmp_path):
     assert not (tmp_path / "pinclip_error.log").exists()
 
 
-@pytest.mark.parametrize("icon", ["minus", "square", "close", "check", "copy", "pin", "pin_off"])
+@pytest.mark.parametrize("icon", ["minus", "close", "check", "copy", "pin", "pin_off"])
 def test_every_icon_draws_something(app, icon):
     button = IconButton(app.root, icon, lambda: None, width=40, height=30, icon_size=16,
                         fg="#000000", bg="#ffffff")
