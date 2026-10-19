@@ -1,45 +1,64 @@
-"""釘選剪貼簿：永遠顯示在最上層的小視窗，只保存「你自己貼進來」的文字，一鍵複製。
+"""剪貼簿：永遠顯示在最上層的小視窗，只保存「你自己貼進來」的文字，一鍵複製。
 
 不會監看系統剪貼簿：內容只有在你按「儲存」（Ctrl+Enter）或「貼上並儲存」時才會加入。
 資料放在使用者資料夾（Windows 是 %APPDATA%\\pinclip），不放在程式資料夾，避免被 git 收進去。
 """
 import json
+import math
 import os
 import re
 import shutil
 import sys
 import traceback
+import zlib
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 
-APP_TITLE = "釘選剪貼簿"
+APP_TITLE = "剪貼簿"
 DEFAULT_SIZE = (360, 520)       # 以 96 DPI 的像素計；高 DPI 螢幕會依比例放大
 MIN_SIZE = (260, 300)
 DEFAULT_GEOMETRY = "%dx%d" % DEFAULT_SIZE
 
-# 配色
-SHELL = "#c3c9d4"           # 視窗外框
-BG = "#f1f3f7"              # 內容區底色
-HEADER = "#262a35"
-HEADER_FG = "#ffffff"
-HEADER_MUTED = "#a3abbd"
-HEADER_HOVER = "#3a4050"
+# 配色：馬卡龍淡色系
+SHELL = "#ead9ee"           # 視窗外框（淡紫）
+BG = "#fffaf5"              # 內容區底色（奶油）
+HEADER = "#fbdce7"          # 標題列（草莓粉）
+HEADER_FG = "#6e4a5f"
+HEADER_MUTED = "#a5899b"
+HEADER_HOVER = "#f6c6d8"
+CLOSE_HOVER = "#ff9fb7"
+PIN_ON_BG = "#dccdf7"       # 釘選中的底色（薰衣草）
+PIN_ON_FG = "#5b3f9a"
 CARD_BG = "#ffffff"
-BORDER = "#dce0e8"
-TEXT = "#1f2430"
-MUTED = "#7a8394"
-ACCENT = "#3b6df6"
-ACCENT_DARK = "#2a55d3"
-ACCENT_SOFT = "#e4ebff"
-NEUTRAL = "#e3e6ed"
-NEUTRAL_HOVER = "#d5d9e2"
-OK = "#1f9d55"
-DANGER = "#e5484d"
-SCROLL = "#c4c9d4"
-SCROLL_HOVER = "#9aa2b2"
-WHITE = "#ffffff"
+BORDER = "#f0e4ee"
+HOVER_BORDER = "#cdb8f2"
+DRAG_BORDER = "#a98be8"
+TEXT = "#4b4458"
+MUTED = "#a198ad"
+PRIMARY = "#cdb8f6"         # 「儲存」（薰衣草）
+PRIMARY_HOVER = "#bca2f0"
+PRIMARY_FG = "#4a2f7a"
+SECONDARY = "#c8f1e0"       # 「貼上並儲存」（薄荷）
+SECONDARY_HOVER = "#b2e8d2"
+SECONDARY_FG = "#2c6a54"
+COPY_BG = "#d4ebff"         # 複製（天空藍）
+COPY_HOVER = "#b9dcfb"
+COPY_FG = "#386d9c"
+COPY_DONE_BG = "#bdf0d6"
+COPY_DONE_FG = "#1f7a52"
+DELETE_FG = "#c0b4c9"
+DELETE_HOVER_BG = "#ffd3df"
+DELETE_HOVER_FG = "#c0405f"
+HANDLE = "#d6cce0"
+OK = "#2f9e72"
+WARN = "#d6456a"
+UNDO = "#7c5cd6"
+SCROLL = "#e4d8ec"
+SCROLL_HOVER = "#cdb8dc"
+# 每張卡片左邊的色條，依內容固定選色（重開、換順序都不會變）
+STRIPES = ("#ffc8dd", "#ffdab9", "#fff1a8", "#b9f0d6", "#bde0fe", "#d9c7f5")
 
 CJK_FONTS = ("Microsoft JhengHei UI", "Microsoft JhengHei", "PingFang TC",
              "Noto Sans CJK TC", "Noto Sans TC", "Noto Sans CJK JP")
@@ -79,6 +98,10 @@ def preview(text, max_lines=3, max_chars=140):
         shown = shown[:max_chars]
         truncated = True
     return shown + ("…" if truncated else "")
+
+
+def stripe_color(text):
+    return STRIPES[zlib.crc32(text.encode("utf-8")) % len(STRIPES)]
 
 
 _GEOMETRY = re.compile(r"^(\d+)x(\d+)(?:\+(-?\d+)\+(-?\d+))?$")
@@ -172,24 +195,97 @@ class ClipStore:
         self.items.insert(min(index, len(self.items)), text)
         self.save()
 
+    def move(self, src, dst):
+        """把第 src 筆移到第 dst 的位置（手動排序）。"""
+        if src == dst:
+            return
+        self.items.insert(dst, self.items.pop(src))
+        self.save()
+
     def set_window(self, geometry, pinned):
         self.window = {"geometry": geometry, "pinned": bool(pinned)}
         self.save()
 
 
-class FlatButton(tk.Label):
-    """用 Label 做的扁平按鈕：系統原生按鈕又舊又不能配色，這個可以自訂顏色、有滑過效果。"""
+# ---- 圖標與按鈕 -------------------------------------------------------------
+# 圖標都是用 Canvas 畫的線條，不靠字型：換電腦、換字型都長一樣，也不會有 emoji 變成方框的問題。
 
-    def __init__(self, master, text, command, fg, bg, hover_fg=None, hover_bg=None, **options):
-        super().__init__(master, text=text, fg=fg, bg=bg, cursor="hand2", **options)
+def rounded_rect(canvas, x1, y1, x2, y2, r, **options):
+    points = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+              x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(points, smooth=True, **options)
+
+
+def draw_icon(canvas, name, ox, oy, size, color, fill, width):
+    """在 (ox, oy) 起、邊長 size 的方框裡畫圖標。座標以 16×16 為準再縮放。fill 是按鈕底色。"""
+    unit = size / 16
+
+    def pt(x, y):
+        return ox + x * unit, oy + y * unit
+
+    def line(*points):
+        coords = [c for p in points for c in pt(*p)]
+        canvas.create_line(*coords, fill=color, width=width, capstyle="round",
+                           joinstyle="round")
+
+    def rect(x1, y1, x2, y2, inside=""):
+        canvas.create_rectangle(*pt(x1, y1), *pt(x2, y2), outline=color, fill=inside,
+                                width=width)
+
+    if name == "minus":
+        line((3, 8), (13, 8))
+    elif name == "square":
+        rect(3.5, 3.5, 12.5, 12.5)
+    elif name == "close":
+        line((4, 4), (12, 12))
+        line((12, 4), (4, 12))
+    elif name == "check":
+        line((3, 8.5), (6.5, 12), (13, 4.5))
+    elif name == "copy":
+        rect(6, 2.5, 13.5, 10.5)
+        rect(2.5, 5.5, 10, 13.5, inside=fill)
+    elif name in ("pin", "pin_off"):
+        # 圖釘：釘選中是直立實心；沒釘選是歪倒的空心
+        head = [(5, 2), (11, 2), (11, 4), (10, 4.5), (10, 8), (12, 10), (12, 11),
+                (4, 11), (4, 10), (6, 8), (6, 4.5), (5, 4)]
+        needle = [(8, 11), (8, 15)]
+        if name == "pin_off":
+            angle = math.radians(45)
+            sin, cos = math.sin(angle), math.cos(angle)
+
+            def rotate(p):
+                dx, dy = p[0] - 8, p[1] - 8
+                return 8 + dx * cos - dy * sin, 8 + dx * sin + dy * cos
+
+            head, needle = [rotate(p) for p in head], [rotate(p) for p in needle]
+        coords = [c for p in head for c in pt(*p)]
+        canvas.create_polygon(*coords, fill=color if name == "pin" else "", outline=color,
+                              width=width, joinstyle="round")
+        line(*needle)
+
+
+def set_cursor(widget, *names):
+    """游標名稱各系統不一樣（Windows 有 size_nw_se、X11 有 bottom_right_corner…），用第一個能用的。"""
+    for name in names:
+        try:
+            widget.configure(cursor=name)
+            return
+        except tk.TclError:
+            continue
+
+
+class _Clickable:
+    """按鈕共用的行為：滑過變色、在按鈕上放開才算按下、暫時換成另一個樣子（flash）。"""
+
+    def _init_click(self, command, fg, bg, hover_fg, hover_bg):
         self.command = command
         self._hovering = False
         self._flash_job = None
         self._saved = None
-        self.set_colors(fg, bg, hover_fg, hover_bg)
         self.bind("<Enter>", lambda e: self._paint(True))
         self.bind("<Leave>", lambda e: self._paint(False))
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.set_colors(fg, bg, hover_fg, hover_bg)
 
     def set_colors(self, fg, bg, hover_fg=None, hover_bg=None):
         self._colors = (fg, bg, hover_fg or fg, hover_bg or bg)
@@ -198,7 +294,7 @@ class FlatButton(tk.Label):
     def _paint(self, hovering):
         self._hovering = hovering
         fg, bg, hover_fg, hover_bg = self._colors
-        self.configure(fg=hover_fg if hovering else fg, bg=hover_bg if hovering else bg)
+        self._render(hover_fg if hovering else fg, hover_bg if hovering else bg)
 
     def _on_release(self, event):
         # 在按鈕上放開才算按下；按住後把游標拖出去再放開就取消
@@ -208,28 +304,84 @@ class FlatButton(tk.Label):
     def invoke(self):
         self.command()
 
-    def flash(self, text, fg, bg, ms=1200):
-        """暫時換成另一組文字和顏色（例如「已複製 ✓」），過一下自動還原。"""
+    def flash(self, content, fg, bg, ms=1200):
+        """暫時換成另一組內容和顏色（例如打勾的「已複製」），過一下自動還原。"""
         if self._flash_job is None:
-            self._saved = (self.cget("text"), self._colors)
+            self._saved = (self._get_content(), self._colors)
         else:
             self.after_cancel(self._flash_job)
-        self.configure(text=text)
+        self._set_content(content)
         self.set_colors(fg, bg)
         self._flash_job = self.after(ms, self._restore)
 
     def _restore(self):
         self._flash_job = None
         try:
-            text, colors = self._saved
-            self.configure(text=text)
+            content, colors = self._saved
+            self._set_content(content)
             self.set_colors(*colors)
         except tk.TclError:
             pass        # 這顆按鈕已經在重新整理列表時被丟掉了
 
 
+class FlatButton(_Clickable, tk.Label):
+    """文字按鈕：用 Label 做的扁平按鈕（系統原生按鈕又舊又不能配色）。"""
+
+    def __init__(self, master, text, command, fg, bg, hover_fg=None, hover_bg=None, **options):
+        tk.Label.__init__(self, master, text=text, fg=fg, bg=bg, cursor="hand2", **options)
+        self._init_click(command, fg, bg, hover_fg, hover_bg)
+
+    def _render(self, fg, bg):
+        self.configure(fg=fg, bg=bg)
+
+    def _get_content(self):
+        return self.cget("text")
+
+    def _set_content(self, text):
+        self.configure(text=text)
+
+
+class IconButton(_Clickable, tk.Canvas):
+    """圖標按鈕：圖標用 draw_icon 畫；radius > 0 時是圓角底色，surface 是圓角外面露出的顏色。"""
+
+    def __init__(self, master, icon, command, width, height, icon_size, fg, bg,
+                 hover_fg=None, hover_bg=None, surface=None, radius=0, line=1.6):
+        tk.Canvas.__init__(self, master, width=width, height=height, bg=surface or bg,
+                           highlightthickness=0, bd=0, cursor="hand2")
+        self.icon = icon
+        self._shape = (width, height, icon_size, radius, line)
+        self._current = (fg, bg)
+        self.bind("<Configure>", lambda e: self._redraw())
+        self._init_click(command, fg, bg, hover_fg, hover_bg)
+
+    def _render(self, fg, bg):
+        self._current = (fg, bg)
+        self._redraw()
+
+    def _get_content(self):
+        return self.icon
+
+    def _set_content(self, icon):
+        self.icon = icon
+
+    def _redraw(self):
+        fg, bg = self._current
+        req_w, req_h, size, radius, line = self._shape
+        w = self.winfo_width() if self.winfo_width() > 1 else req_w
+        h = self.winfo_height() if self.winfo_height() > 1 else req_h
+        self.delete("all")
+        if radius:
+            rounded_rect(self, 0, 0, w - 1, h - 1, radius, fill=bg, outline=bg)
+        else:
+            self.create_rectangle(0, 0, w, h, fill=bg, outline=bg)
+        draw_icon(self, self.icon, (w - size) / 2, (h - size) / 2, size, fg, bg, line)
+
+
 class Card(tk.Frame):
-    """列表裡的一筆內容。"""
+    """列表裡的一筆內容。text 是這筆的文字；hover_update 重新判斷游標在不在卡片上。"""
+
+    text = ""
+    hover_update = None
 
 
 class PinClipApp:
@@ -242,9 +394,13 @@ class PinClipApp:
         self._undo = None
         self._status_job = None
         self._labels = []
+        self._cards = []            # 畫面上卡片的順序（拖曳排序時會即時改變）
         self._wrap = 200
-        self._drag = None
+        self._drag = None           # 拖曳移動視窗
         self._resize = None
+        self._press_pos = None      # 按下卡片的位置；移動超過幾個像素才算拖曳
+        self._drag_card = None      # 正在被拖曳排序的卡片
+        self._autoscroll_job = None
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self.min_w, self.min_h = self.px(MIN_SIZE[0]), self.px(MIN_SIZE[1])
@@ -293,7 +449,6 @@ class PinClipApp:
         self.f_bold = font(10, "bold")
         self.f_small_bold = font(9, "bold")
         self.f_title = font(11, "bold")
-        self.f_icon = font(11)
 
     def _make_styles(self):
         style = ttk.Style(self.root)
@@ -324,9 +479,9 @@ class PinClipApp:
         wrap.pack(fill="x", padx=P(10), pady=(P(10), 0))
         self.input = tk.Text(
             wrap, height=4, wrap="word", undo=True, relief="flat", bd=0, font=self.f_body,
-            bg=CARD_BG, fg=TEXT, insertbackground=TEXT, selectbackground=ACCENT_SOFT,
-            selectforeground=TEXT, highlightthickness=1, highlightbackground=BORDER,
-            highlightcolor=ACCENT, padx=P(8), pady=P(6))
+            bg=CARD_BG, fg=TEXT, insertbackground=TEXT, selectbackground=PRIMARY,
+            selectforeground=PRIMARY_FG, highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=PRIMARY_HOVER, padx=P(8), pady=P(6))
         self.input.pack(fill="x")
         self.input.bind("<Control-Return>", self._on_save_key)
         self.input.bind("<Control-KP_Enter>", self._on_save_key)
@@ -335,11 +490,11 @@ class PinClipApp:
 
         actions = tk.Frame(self.body, bg=BG)
         actions.pack(fill="x", padx=P(10), pady=(P(8), 0))
-        FlatButton(actions, "貼上並儲存", self.paste_and_save, fg=TEXT, bg=NEUTRAL,
-                   hover_bg=NEUTRAL_HOVER, font=self.f_small_bold, padx=P(12),
+        FlatButton(actions, "貼上並儲存", self.paste_and_save, fg=SECONDARY_FG, bg=SECONDARY,
+                   hover_bg=SECONDARY_HOVER, font=self.f_small_bold, padx=P(12),
                    pady=P(5)).pack(side="left")
-        FlatButton(actions, "儲存", self.save_input, fg=WHITE, bg=ACCENT,
-                   hover_bg=ACCENT_DARK, font=self.f_small_bold, padx=P(18),
+        FlatButton(actions, "儲存", self.save_input, fg=PRIMARY_FG, bg=PRIMARY,
+                   hover_bg=PRIMARY_HOVER, font=self.f_small_bold, padx=P(18),
                    pady=P(5)).pack(side="right")
         tk.Label(actions, text="Ctrl+Enter", bg=BG, fg=MUTED, font=self.f_small).pack(
             side="right", padx=P(8))
@@ -377,19 +532,23 @@ class PinClipApp:
         self.header = tk.Frame(parent, bg=HEADER)
         self.header.pack(fill="x")
         title = tk.Label(self.header, text=APP_TITLE, bg=HEADER, fg=HEADER_FG,
-                         font=self.f_title, padx=P(12), pady=P(9))
+                         font=self.f_title, padx=P(14), pady=P(10))
         title.pack(side="left")
-        self.close_button = FlatButton(self.header, "✕", self.close, fg=HEADER_MUTED,
-                                       bg=HEADER, hover_fg=WHITE, hover_bg=DANGER,
-                                       font=self.f_icon, padx=P(14))
+
+        def header_button(icon, command, **options):
+            return IconButton(self.header, icon, command, width=P(40), height=P(38),
+                              icon_size=P(14), fg=HEADER_MUTED, bg=HEADER, hover_fg=HEADER_FG,
+                              hover_bg=HEADER_HOVER, line=1.6 * self.scale, **options)
+
+        self.close_button = header_button("close", self.close)
+        self.close_button.set_colors(HEADER_MUTED, HEADER, HEADER_FG, CLOSE_HOVER)
         self.close_button.pack(side="right", fill="y")
-        self.collapse_button = FlatButton(
-            self.header, "—", self.toggle_collapse, fg=HEADER_MUTED, bg=HEADER,
-            hover_fg=WHITE, hover_bg=HEADER_HOVER, font=self.f_icon, padx=P(14))
+        self.collapse_button = header_button("minus", self.toggle_collapse)
         self.collapse_button.pack(side="right", fill="y")
-        self.pin_button = FlatButton(self.header, "", self.toggle_pin, fg=WHITE, bg=ACCENT,
-                                     font=self.f_small_bold, padx=P(10), pady=P(2))
-        self.pin_button.pack(side="right", padx=P(8), pady=P(8))
+        self.pin_button = IconButton(self.header, "pin", self.toggle_pin, width=P(30),
+                                     height=P(30), icon_size=P(16), fg=PIN_ON_FG, bg=PIN_ON_BG,
+                                     surface=HEADER, radius=P(9), line=1.5 * self.scale)
+        self.pin_button.pack(side="right", padx=P(6), pady=P(4))
         for widget in (self.header, title):
             widget.bind("<Double-Button-1>", lambda e: self.toggle_collapse())
             if self.custom_frame:       # 沒有系統標題列時，拖這一條來移動視窗
@@ -399,15 +558,10 @@ class PinClipApp:
     def _build_grip(self, parent):
         size = self.px(14)
         self.grip = tk.Canvas(parent, width=size, height=size, bg=BG, highlightthickness=0)
-        for cursor in ("size_nw_se", "bottom_right_corner"):     # 前者 Windows 才有，後者 X11 才有
-            try:
-                self.grip.configure(cursor=cursor)
-                break
-            except tk.TclError:
-                continue
+        set_cursor(self.grip, "size_nw_se", "bottom_right_corner")
         for i in (4, 8, 12):
             i = self.px(i)
-            self.grip.create_line(size, i, i, size, fill=MUTED)
+            self.grip.create_line(size, i, i, size, fill=HANDLE)
         self.grip.pack(side="right")
         self.grip.bind("<ButtonPress-1>", self._resize_start)
         self.grip.bind("<B1-Motion>", self._resize_move)
@@ -415,11 +569,14 @@ class PinClipApp:
 
     def refresh(self):
         P = self.px
+        self._stop_drag()
         for child in self.inner.winfo_children():
             child.destroy()
         self._labels = []
+        self._cards = []
         count = len(self.store.items)
-        self.count.configure(text=f"已儲存 {count} 筆" if count else "")
+        hint = "　拖曳卡片可以調整順序" if count > 1 else ""
+        self.count.configure(text=f"已儲存 {count} 筆{hint}" if count else "")
         if not count:
             empty = tk.Frame(self.inner, bg=BG)
             empty.pack(fill="x", pady=P(30))
@@ -427,61 +584,178 @@ class PinClipApp:
             tk.Label(empty, text="在上方貼上文字，按「儲存」", bg=BG, fg=MUTED,
                      font=self.f_small).pack(pady=(P(4), 0))
             return
-        for index, text in enumerate(self.store.items):
-            self._add_card(index, text)
+        for text in self.store.items:
+            self._add_card(text)
         self._update_wrap()
 
-    def _add_card(self, index, text):
+    def _pads(self):
+        """卡片裡各元件左右的留白。換行寬度的計算也用同一份，兩邊才不會對不上。"""
         P = self.px
+        return {"card": (P(10), P(14)), "handle": (P(8), 0), "label": (P(6), P(6)),
+                "copy": (0, P(4)), "delete": (0, P(8))}
+
+    def _add_card(self, text):
+        P = self.px
+        pads = self._pads()
         card = Card(self.inner, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER,
                     highlightcolor=BORDER)
-        card.pack(fill="x", padx=(P(10), P(14)), pady=(0, P(6)))
-        card.columnconfigure(0, weight=1)
+        card.text = text
+        card.pack(fill="x", padx=pads["card"], pady=(0, P(6)))
+        card.columnconfigure(2, weight=1)
         label = tk.Label(card, text=preview(text), bg=CARD_BG, fg=TEXT, font=self.f_body,
                          justify="left", anchor="nw", wraplength=self._wrap, cursor="hand2")
-        label.grid(row=0, column=0, sticky="nsew", padx=(P(10), P(6)), pady=P(8))
+        label.grid(row=0, column=2, sticky="nsew", padx=pads["label"], pady=P(8))
         self._labels.append(label)
-        copy_button = FlatButton(
-            card, "複製", lambda: self.copy(text, copy_button), fg=ACCENT, bg=ACCENT_SOFT,
-            hover_fg=WHITE, hover_bg=ACCENT, font=self.f_small_bold, width=6, pady=P(3))
-        copy_button.grid(row=0, column=1, padx=(0, P(4)), pady=P(8), sticky="n")
-        FlatButton(card, "✕", lambda: self.delete(index), fg=MUTED, bg=CARD_BG,
-                   hover_fg=WHITE, hover_bg=DANGER, font=self.f_small, width=2,
-                   pady=P(3)).grid(row=0, column=2, padx=(0, P(8)), pady=P(8), sticky="n")
-        label.bind("<Button-1>", lambda e: self.copy(text, copy_button))
+
+        stripe = tk.Frame(card, bg=stripe_color(text), width=P(5))
+        stripe.grid(row=0, column=0, sticky="ns")
+        handle = tk.Canvas(card, width=P(12), height=P(24), bg=CARD_BG, highlightthickness=0)
+        set_cursor(handle, "fleur", "size")
+        radius = max(1.0, 1.1 * self.scale)
+        for cx in (P(3), P(9)):
+            for cy in (P(5), P(12), P(19)):
+                handle.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                                   fill=HANDLE, outline=HANDLE)
+        handle.grid(row=0, column=1, sticky="n", padx=pads["handle"], pady=(P(10), 0))
+
+        copy_button = IconButton(
+            card, "copy", lambda: self.copy(text, copy_button), width=P(32), height=P(28),
+            icon_size=P(15), fg=COPY_FG, bg=COPY_BG, hover_bg=COPY_HOVER, surface=CARD_BG,
+            radius=P(8), line=1.5 * self.scale)
+        copy_button.grid(row=0, column=3, padx=pads["copy"], pady=P(8), sticky="n")
+        delete_button = IconButton(
+            card, "close", lambda: self.delete(text), width=P(26), height=P(28),
+            icon_size=P(12), fg=DELETE_FG, bg=CARD_BG, hover_fg=DELETE_HOVER_FG,
+            hover_bg=DELETE_HOVER_BG, radius=P(8), line=1.5 * self.scale)
+        delete_button.grid(row=0, column=4, padx=pads["delete"], pady=P(8), sticky="n")
+
+        # 按住卡片（文字、色條、把手、空白處）拖動就是排序；沒移動就放開，點文字＝複製
+        for widget, click in ((label, lambda: self.copy(text, copy_button)), (card, None),
+                              (stripe, None), (handle, None)):
+            self._bind_drag(widget, card, click)
         self._watch_hover(card)
+        self._cards.append(card)
 
     def _watch_hover(self, card):
-        """游標在卡片上（含裡面的按鈕）時外框變色。"""
+        """游標在卡片上（含裡面的按鈕）時外框變色；正在被拖曳的卡片維持拖曳的顏色。"""
         def update(_event=None):
+            if card is self._drag_card:
+                return
             try:
                 x, y = card.winfo_pointerxy()
                 under = card.winfo_containing(x, y)
             except (KeyError, tk.TclError):
                 return
             inside = under is not None and str(under).startswith(str(card))
-            card.configure(highlightbackground=ACCENT if inside else BORDER)
+            card.configure(highlightbackground=HOVER_BORDER if inside else BORDER)
 
+        card.hover_update = update
         for widget in (card, *card.winfo_children()):
             widget.bind("<Enter>", update, add="+")
             widget.bind("<Leave>", update, add="+")
+
+    # ---- 拖曳排序 --------------------------------------------------------
+
+    def _bind_drag(self, widget, card, click):
+        widget.bind("<ButtonPress-1>", lambda e: self._card_press(e))
+        widget.bind("<B1-Motion>", lambda e: self._card_motion(e, card))
+        widget.bind("<ButtonRelease-1>", lambda e: self._card_release(click))
+
+    def _card_press(self, event):
+        self._press_pos = (event.x_root, event.y_root)
+
+    def _card_motion(self, event, card):
+        if self._press_pos is None:
+            return
+        if self._drag_card is None:
+            moved = max(abs(event.x_root - self._press_pos[0]),
+                        abs(event.y_root - self._press_pos[1]))
+            if moved < self.px(5):
+                return          # 還只是點一下，手抖的幾個像素不算拖曳
+            self._drag_card = card
+            card.configure(highlightbackground=DRAG_BORDER)
+            self._autoscroll()
+        self._reorder_to(event.y_root)
+
+    def _card_release(self, click):
+        if self._drag_card is not None:
+            self._drop()
+        elif click is not None and self._press_pos is not None:
+            click()
+        self._press_pos = None
+
+    def _reorder_to(self, y_root):
+        """依游標高度，把拖曳中的卡片即時換到對應位置（其他卡片會讓開）。"""
+        card = self._drag_card
+        y = y_root - self.inner.winfo_rooty()
+        others = [c for c in self._cards if c is not card]
+        target = sum(1 for c in others if c.winfo_y() + c.winfo_height() / 2 < y)
+        if target == self._cards.index(card):
+            return
+        self._cards.remove(card)
+        self._cards.insert(target, card)
+        if target + 1 < len(self._cards):
+            card.pack_configure(before=self._cards[target + 1])
+        else:
+            card.pack_configure(after=self._cards[target - 1])
+        self.inner.update_idletasks()
+
+    def _autoscroll(self):
+        """拖到列表上緣或下緣時，列表自己往那邊捲，這樣長列表也能拖到很遠的位置。"""
+        if self._drag_card is None:
+            return
+        pointer_y = self.canvas.winfo_pointery()
+        y = pointer_y - self.canvas.winfo_rooty()
+        zone = self.px(28)
+        before = self.canvas.yview()
+        if y < zone:
+            self.canvas.yview_scroll(-1, "units")
+        elif y > self.canvas.winfo_height() - zone:
+            self.canvas.yview_scroll(1, "units")
+        if self.canvas.yview() != before:
+            self._reorder_to(pointer_y)
+        self._autoscroll_job = self.root.after(50, self._autoscroll)
+
+    def _stop_drag(self):
+        if self._autoscroll_job is not None:
+            self.root.after_cancel(self._autoscroll_job)
+            self._autoscroll_job = None
+        self._drag_card = None
+        self._press_pos = None
+
+    def _drop(self):
+        card = self._drag_card
+        self._stop_drag()
+        src = self.store.items.index(card.text)
+        dst = self._cards.index(card)
+        card.configure(highlightbackground=BORDER)
+        if card.hover_update:
+            card.hover_update()
+        if src == dst:
+            return
+        self.store.move(src, dst)
+        if self.store.save_failed:
+            self.set_status("已調整順序，但無法寫入資料檔", "warn")
+        else:
+            self.set_status("已調整順序", "ok")
+
+    # ---- 捲動與換行 ------------------------------------------------------
 
     def _on_canvas_resize(self, event):
         self.canvas.itemconfigure(self._inner_id, width=event.width)
         self._update_wrap()
 
     def _update_wrap(self):
-        """文字的換行寬度 = 視窗寬度扣掉按鈕和各處的邊距，免得字被按鈕蓋住。"""
+        """文字的換行寬度 = 視窗寬度扣掉其他元件和各處的留白，免得字被按鈕蓋住。"""
         if not self._labels:
             return
-        P = self.px
-        card = self._labels[0].master
-        buttons = sum(w.winfo_reqwidth() for w in card.winfo_children()
-                      if isinstance(w, FlatButton))
-        chrome = P(10) + P(14) + 2 + P(10) + P(6) + P(4) + P(8)
-        self._wrap = max(80, self.canvas.winfo_width() - buttons - chrome)
-        for label in self._labels:
-            label.configure(wraplength=self._wrap)
+        label = self._labels[0]
+        card = label.master
+        fixed = sum(w.winfo_reqwidth() for w in card.winfo_children() if w is not label)
+        margins = sum(a + b for a, b in self._pads().values()) + 2
+        self._wrap = max(80, self.canvas.winfo_width() - fixed - margins)
+        for each in self._labels:
+            each.configure(wraplength=self._wrap)
 
     def _on_yview(self, first, last):
         self.scroll.set(first, last)
@@ -508,11 +782,11 @@ class PinClipApp:
     def apply_pin(self):
         self.root.attributes("-topmost", self.pinned)
         if self.pinned:
-            self.pin_button.configure(text="已釘選")
-            self.pin_button.set_colors(WHITE, ACCENT, WHITE, ACCENT_DARK)
+            self.pin_button.icon = "pin"
+            self.pin_button.set_colors(PIN_ON_FG, PIN_ON_BG, PIN_ON_FG, "#cdbbf3")
         else:
-            self.pin_button.configure(text="未釘選")
-            self.pin_button.set_colors(HEADER_MUTED, HEADER_HOVER, WHITE, "#4a5166")
+            self.pin_button.icon = "pin_off"
+            self.pin_button.set_colors(HEADER_MUTED, HEADER, HEADER_FG, HEADER_HOVER)
 
     def toggle_pin(self):
         self.pinned = not self.pinned
@@ -530,7 +804,7 @@ class PinClipApp:
             root.minsize(self.min_w, height)
             root.geometry(f"{root.winfo_width()}x{height}")
             root.resizable(True, False)
-            self.collapse_button.configure(text="□")
+            self.collapse_button.icon = "square"
             if self.custom_frame:
                 self.grip.pack_forget()
         else:
@@ -538,7 +812,10 @@ class PinClipApp:
             root.minsize(self.min_w, self.min_h)
             root.geometry(f"{root.winfo_width()}x{self._expanded_height}")
             self.body.pack(fill="both", expand=True)
-            self.collapse_button.configure(text="—")
+            self.collapse_button.icon = "minus"
+            if self.custom_frame:
+                self.grip.pack(side="right")
+        self.collapse_button.set_colors(*self.collapse_button._colors)       # 重畫
         self.collapsed = not self.collapsed
 
     def _drag_start(self, event):
@@ -618,10 +895,11 @@ class PinClipApp:
         self.root.update()      # Windows：讓剪貼簿內容在程式關掉後仍然保留
         self.set_status("已複製", "ok")
         if button is not None:
-            button.flash("已複製 ✓", WHITE, OK)
+            button.flash("check", COPY_DONE_FG, COPY_DONE_BG)
 
-    def delete(self, index):
-        text = self.store.remove(index)
+    def delete(self, text):
+        index = self.store.items.index(text)
+        self.store.remove(index)
         self.refresh()
         self.set_status("已刪除　按這裡復原", "undo", undo=(index, text), ms=6000)
 
@@ -637,7 +915,7 @@ class PinClipApp:
         if self._status_job is not None:
             self.root.after_cancel(self._status_job)
         self._undo = undo
-        color = {"ok": OK, "warn": DANGER, "undo": ACCENT}.get(tone, MUTED)
+        color = {"ok": OK, "warn": WARN, "undo": UNDO}.get(tone, MUTED)
         self.status.configure(text=text, fg=color, cursor="hand2" if undo else "")
         self._status_job = self.root.after(ms, self._clear_status)
 
@@ -654,6 +932,7 @@ class PinClipApp:
         return geometry
 
     def close(self):
+        self._stop_drag()
         self.root.update()      # 讓剛複製的內容留在系統剪貼簿
         self.store.set_window(self._geometry_for_save(), self.pinned)
         self.root.destroy()

@@ -12,7 +12,8 @@ pytest.importorskip("tkinter")
 import tkinter as tk
 
 import pinclip
-from pinclip import Card, ClipStore, FlatButton, PinClipApp, fit_geometry, preview
+from pinclip import (Card, ClipStore, FlatButton, IconButton, PinClipApp, fit_geometry,
+                     preview, stripe_color)
 
 
 # ---- 純邏輯 ----------------------------------------------------------------
@@ -56,6 +57,25 @@ def test_remove_and_restore_at_same_position(tmp_path):
     assert removed == "b" and store.items == ["a", "c"]
     store.restore(1, removed)
     assert store.items == ["a", "b", "c"]
+
+
+def test_move_reorders_and_persists(tmp_path):
+    path = tmp_path / "p.json"
+    store = ClipStore(path)
+    for text in ("d", "c", "b", "a"):
+        store.add(text)
+    assert store.items == ["a", "b", "c", "d"]
+    store.move(0, 2)
+    assert store.items == ["b", "c", "a", "d"]
+    store.move(3, 0)
+    assert store.items == ["d", "b", "c", "a"]
+    store.move(1, 1)                                    # 沒換位置就什麼都不做
+    assert ClipStore(path).items == ["d", "b", "c", "a"]
+
+
+def test_stripe_color_is_stable_per_text():
+    assert stripe_color("同一段文字") == stripe_color("同一段文字")
+    assert {stripe_color(f"項目 {i}") for i in range(40)} == set(pinclip.STRIPES)
 
 
 def test_missing_file_gives_empty_store(tmp_path):
@@ -198,8 +218,17 @@ def cards(app):
     return [c for c in app.inner.winfo_children() if isinstance(c, Card)]
 
 
-def card_button(card, text):
-    return next(w for w in card.winfo_children() if isinstance(w, FlatButton) and w.cget("text") == text)
+def card_button(card, icon):
+    return next(w for w in card.winfo_children() if isinstance(w, IconButton) and w.icon == icon)
+
+
+def shown(app):
+    """依畫面上由上到下的順序列出卡片（拖曳排序會改變順序，winfo_children 還是建立順序）。"""
+    return [w for w in app.inner.pack_slaves() if isinstance(w, Card)]
+
+
+def card_text(card):
+    return card.winfo_children()[0].cget("text")
 
 
 def event(**kwargs):
@@ -208,7 +237,7 @@ def event(**kwargs):
 
 def test_starts_pinned_with_empty_hint(app):
     assert app.topmost_calls == [True]
-    assert app.pin_button.cget("text") == "已釘選"
+    assert app.pin_button.icon == "pin"
     assert cards(app) == []
 
 
@@ -237,9 +266,9 @@ def test_copy_button_puts_full_text_on_clipboard(app):
     app.refresh()
     card = cards(app)[0]
     assert "…" in card.winfo_children()[0].cget("text")       # 卡片只顯示摘要
-    card_button(card, "複製").invoke()
+    card_button(card, "copy").invoke()
     assert app.root.clipboard_get() == long_text             # 複製出來的是完整內容
-    assert card_button(card, "已複製 ✓")
+    assert card_button(card, "check")                        # 按鈕暫時變成打勾
 
 
 def test_clicking_the_text_also_copies(app):
@@ -247,7 +276,9 @@ def test_clicking_the_text_also_copies(app):
     app.refresh()
     app.root.update()
     app.root.clipboard_clear()
-    cards(app)[0].winfo_children()[0].event_generate("<Button-1>")
+    label = cards(app)[0].winfo_children()[0]
+    label.event_generate("<ButtonPress-1>", x=5, y=5)
+    label.event_generate("<ButtonRelease-1>", x=5, y=5)
     assert app.root.clipboard_get() == "點文字也能複製"
 
 
@@ -271,7 +302,7 @@ def test_delete_then_undo(app):
     for text in ("c", "b", "a"):
         app.store.add(text)
     app.refresh()
-    card_button(cards(app)[1], "✕").invoke()
+    card_button(cards(app)[1], "close").invoke()
     assert app.store.items == ["a", "c"]
     app.status.event_generate("<Button-1>")
     assert app.store.items == ["a", "b", "c"]
@@ -288,7 +319,7 @@ def test_new_item_scrolls_list_to_top_and_shows_first(app):
     app.save_input()
     app.root.update()
     assert app.canvas.yview()[0] == 0
-    assert cards(app)[0].winfo_children()[0].cget("text") == "最新的"
+    assert card_text(cards(app)[0]) == "最新的"
 
 
 def test_scrollbar_only_shows_when_list_overflows(app):
@@ -307,17 +338,150 @@ def test_long_text_wraps_inside_the_card(app):
     app.root.update()
     card = cards(app)[0]
     label = card.winfo_children()[0]
-    copy_button = card_button(card, "複製")
+    copy_button = card_button(card, "copy")
     assert label.winfo_x() + label.winfo_reqwidth() <= copy_button.winfo_x()      # 文字不會被按鈕蓋住
+
+
+def test_title_is_just_the_app_name(app):
+    titles = [w.cget("text") for w in app.header.winfo_children() if isinstance(w, tk.Label)]
+    assert titles == ["剪貼簿"]
+    assert app.root.title() == "剪貼簿"
+    texts = [w.cget("text") for w in app.header.winfo_children() if isinstance(w, FlatButton)]
+    assert texts == []                                  # 標題列的按鈕都是圖標，沒有文字
+
+
+# ---- 拖曳排序 ---------------------------------------------------------------
+
+def three_cards(app):
+    for text in ("c", "b", "a"):
+        app.store.add(text)
+    app.refresh()
+    app.root.update()
+    return cards(app)
+
+
+def drag(app, card, to_y_root):
+    """模擬按住卡片、拖到某個高度（螢幕座標）、放開。"""
+    top = card.winfo_rooty() + 5
+    app._card_press(event(x_root=100, y_root=top))
+    app._card_motion(event(x_root=100, y_root=top + 10), card)
+    app._card_motion(event(x_root=100, y_root=to_y_root), card)
+    app._card_release(None)
+
+
+def below(app, card):
+    return card.winfo_rooty() + card.winfo_height()
+
+
+def test_drag_first_card_to_the_bottom(app):
+    a, b, c = three_cards(app)
+    drag(app, a, below(app, c) + 5)
+    app.root.update()
+    assert app.store.items == ["b", "c", "a"]
+    assert [card_text(x) for x in shown(app)] == ["b", "c", "a"]             # 畫面上也真的換了
+    assert app._drag_card is None and app._autoscroll_job is None
+    assert "已調整順序" in app.status.cget("text")
+    assert ClipStore(app.store.path).items == ["b", "c", "a"]                # 存檔了
+
+
+def test_drag_last_card_to_the_top(app):
+    a, b, c = three_cards(app)
+    drag(app, c, a.winfo_rooty() - 5)
+    app.root.update()
+    assert app.store.items == ["c", "a", "b"]
+
+
+def test_drag_moves_cards_while_dragging_and_can_go_back(app):
+    a, b, c = three_cards(app)
+    top = a.winfo_rooty() + 5
+    app._card_press(event(x_root=100, y_root=top))
+    app._card_motion(event(x_root=100, y_root=top + 10), a)
+    app._card_motion(event(x_root=100, y_root=below(app, c) + 5), a)
+    assert [w.text for w in app.inner.pack_slaves()] == ["b", "c", "a"]       # 還沒放開就已經讓位
+    app._card_motion(event(x_root=100, y_root=top), a)                        # 又拖回原位
+    assert [w.text for w in app.inner.pack_slaves()] == ["a", "b", "c"]
+    app._card_release(None)
+    assert app.store.items == ["a", "b", "c"]
+    assert "已調整順序" not in app.status.cget("text")                        # 沒換位置就不提示
+
+
+def test_small_wobble_is_a_click_not_a_drag(app):
+    app.store.add("只是點一下")
+    app.refresh()
+    app.root.update()
+    card = cards(app)[0]
+    app.root.clipboard_clear()
+    app._card_press(event(x_root=100, y_root=100))
+    app._card_motion(event(x_root=102, y_root=101), card)
+    assert app._drag_card is None
+    app._card_release(lambda: app.copy("只是點一下"))
+    assert app.root.clipboard_get() == "只是點一下"
+
+
+def test_dragging_does_not_copy(app):
+    a, b, c = three_cards(app)
+    app.root.clipboard_clear()
+    app.root.clipboard_append("原本剪貼簿的內容")
+    clicks = []
+    top = a.winfo_rooty() + 5
+    app._card_press(event(x_root=100, y_root=top))
+    app._card_motion(event(x_root=100, y_root=top + 50), a)
+    app._card_release(lambda: clicks.append(1))
+    assert clicks == [] and app.root.clipboard_get() == "原本剪貼簿的內容"
+
+
+def test_delete_after_reordering_removes_the_right_card(app):
+    a, b, c = three_cards(app)
+    drag(app, a, below(app, c) + 5)
+    app.root.update()
+    card_button(shown(app)[0], "close").invoke()                              # 現在畫面上第一張是 b
+    assert app.store.items == ["c", "a"]
+    assert [card_text(x) for x in shown(app)] == ["c", "a"]
+
+
+def test_dragging_near_the_bottom_edge_scrolls_the_list(app):
+    app.store.items = [f"項目 {i:02d}" for i in range(30)]
+    app.refresh()
+    app.root.update()
+    first = app._cards[0]
+    top = first.winfo_rooty() + 5
+    app._card_press(event(x_root=100, y_root=top))
+    app._card_motion(event(x_root=100, y_root=top + 12), first)
+    edge = app.canvas.winfo_rooty() + app.canvas.winfo_height() - 5
+    app.canvas.winfo_pointery = lambda: edge              # 沒有真的滑鼠，假裝游標停在列表下緣
+    deadline = time.time() + 2
+    while app.canvas.yview()[0] == 0 and time.time() < deadline:
+        app.root.update()
+        time.sleep(0.02)
+    assert app.canvas.yview()[0] > 0                      # 列表自己往下捲了
+    assert app._cards.index(first) > 0                    # 被拖的卡片跟著往下走
+    app._card_release(None)
+    assert app.store.items.index("項目 00") > 0
+    assert app._autoscroll_job is None
+
+
+def test_drag_with_real_mouse_events_on_the_handle(app):
+    a, b, c = three_cards(app)
+    handle = next(w for w in a.winfo_children() if isinstance(w, tk.Canvas) and not isinstance(w, IconButton))
+    handle.event_generate("<ButtonPress-1>", x=3, y=3, rootx=handle.winfo_rootx() + 3,
+                          rooty=handle.winfo_rooty() + 3)
+    handle.event_generate("<B1-Motion>", x=3, y=60, rootx=handle.winfo_rootx() + 3,
+                          rooty=handle.winfo_rooty() + 60)
+    handle.event_generate("<B1-Motion>", x=3, y=160, rootx=handle.winfo_rootx() + 3,
+                          rooty=handle.winfo_rooty() + 160)
+    handle.event_generate("<ButtonRelease-1>", x=3, y=160)
+    app.root.update()
+    assert app.store.items[0] != "a"                                          # 第一張被拖走了
+    assert sorted(app.store.items) == ["a", "b", "c"]
 
 
 # ---- 釘選、縮小、關閉 -------------------------------------------------------
 
 def test_pin_button_toggles_topmost_and_label(app):
     app.pin_button.invoke()
-    assert app.pinned is False and app.pin_button.cget("text") == "未釘選"
+    assert app.pinned is False and app.pin_button.icon == "pin_off"
     app.pin_button.invoke()
-    assert app.pinned is True and app.pin_button.cget("text") == "已釘選"
+    assert app.pinned is True and app.pin_button.icon == "pin"
     assert app.topmost_calls == [True, False, True]
 
 
@@ -327,12 +491,12 @@ def test_collapse_shrinks_to_title_bar_and_restores(app):
     app.root.update()
     assert app.collapsed and not app.body.winfo_ismapped()
     assert app.root.winfo_height() == app.header.winfo_reqheight() + 2 * app._border
-    assert app.collapse_button.cget("text") == "□"
+    assert app.collapse_button.icon == "square"
     app.collapse_button.invoke()
     app.root.update()
     assert not app.collapsed and app.body.winfo_ismapped()
     assert app.root.winfo_height() == before
-    assert app.collapse_button.cget("text") == "—"
+    assert app.collapse_button.icon == "minus"
 
 
 def test_double_click_title_bar_collapses(app):
@@ -370,7 +534,7 @@ def test_items_survive_restart(app, tmp_path):
     app.close()
     again = build_app(tmp_path, app.custom_frame)
     try:
-        assert [c.winfo_children()[0].cget("text") for c in cards(again)] == ["重開之後還在"]
+        assert [card_text(c) for c in cards(again)] == ["重開之後還在"]
     finally:
         destroy(again)
 
@@ -439,12 +603,37 @@ def test_flash_after_the_card_was_rebuilt_does_not_error(app, tmp_path):
     app.store.add("a")
     app.refresh()
     app.root.update()
-    button = card_button(cards(app)[0], "複製")
-    button.flash("已複製 ✓", "#ffffff", "#009900", ms=10)
+    button = card_button(cards(app)[0], "copy")
+    button.flash("check", "#ffffff", "#009900", ms=10)
     app.refresh()                                         # 列表重建，按鈕被丟掉
     time.sleep(0.05)
     app.root.update()
     assert not (tmp_path / "pinclip_error.log").exists()
+
+
+@pytest.mark.parametrize("icon", ["minus", "square", "close", "check", "copy", "pin", "pin_off"])
+def test_every_icon_draws_something(app, icon):
+    button = IconButton(app.root, icon, lambda: None, width=40, height=30, icon_size=16,
+                        fg="#000000", bg="#ffffff")
+    button.pack()
+    app.root.update()
+    assert len(button.find_all()) >= 2                    # 底色加上至少一個線條或形狀
+
+
+def test_icon_button_hover_and_flash_restore_colors(app):
+    button = IconButton(app.root, "copy", lambda: None, width=40, height=30, icon_size=16,
+                        fg="#111111", bg="#eeeeee", hover_bg="#dddddd")
+    button.pack()
+    app.root.update()
+    button.event_generate("<Enter>")
+    assert button._current == ("#111111", "#dddddd")
+    button.event_generate("<Leave>")
+    assert button._current == ("#111111", "#eeeeee")
+    button.flash("check", "#ffffff", "#009900", ms=10)
+    assert button.icon == "check" and button._current == ("#ffffff", "#009900")
+    time.sleep(0.05)
+    app.root.update()
+    assert button.icon == "copy" and button._current == ("#111111", "#eeeeee")
 
 
 def test_callback_error_goes_to_log_file(app, tmp_path):
