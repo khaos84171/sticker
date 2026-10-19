@@ -1,6 +1,6 @@
 """剪貼簿：永遠顯示在最上層的小視窗，只保存「你自己貼進來」的文字，一鍵複製。
 
-不會監看系統剪貼簿：內容只有在你按「儲存」（Ctrl+Enter）或「貼上並儲存」時才會加入。
+不會監看系統剪貼簿：只有你自己貼進輸入框、按「儲存」（Ctrl+Enter）的文字才會加入。
 資料放在使用者資料夾（Windows 是 %APPDATA%\\pinclip），不放在程式資料夾，避免被 git 收進去。
 """
 import json
@@ -41,9 +41,6 @@ MUTED = "#a198ad"
 PRIMARY = "#cdb8f6"         # 「儲存」（薰衣草）
 PRIMARY_HOVER = "#bca2f0"
 PRIMARY_FG = "#4a2f7a"
-SECONDARY = "#c8f1e0"       # 「貼上並儲存」（薄荷）
-SECONDARY_HOVER = "#b2e8d2"
-SECONDARY_FG = "#2c6a54"
 COPY_BG = "#d4ebff"         # 複製（天空藍）
 COPY_HOVER = "#b9dcfb"
 COPY_FG = "#386d9c"
@@ -122,6 +119,32 @@ def edge_scroll_step(y, height, zone, max_step):
     else:
         return 0
     return sign * max(1, round(min(depth, 2.0) * max_step / 2))
+
+
+# 無外框視窗的縮放：視窗最外面一圈邊框（淡紫色）就是拖曳縮放的地方
+EDGE = 5                # 邊框厚度（像素，96 DPI）
+EDGE_CORNER = 18        # 邊框上靠近角落的這一段長度算「角落」，可以斜著拉
+RESIZE_CURSORS = {      # 各系統的游標名稱不同：Windows 是前面的，X11 是後面的
+    "n": ("size_ns", "sb_v_double_arrow"), "s": ("size_ns", "sb_v_double_arrow"),
+    "e": ("size_we", "sb_h_double_arrow"), "w": ("size_we", "sb_h_double_arrow"),
+    "nw": ("size_nw_se", "top_left_corner"), "se": ("size_nw_se", "bottom_right_corner"),
+    "ne": ("size_ne_sw", "top_right_corner"), "sw": ("size_ne_sw", "bottom_left_corner"),
+}
+
+
+def edge_at(x, y, width, height, border, corner):
+    """視窗內座標 (x, y) 在哪個縮放邊：n s e w nw ne sw se，不在邊框上回傳 None。"""
+    left, right = x < border, x >= width - border
+    top, bottom = y < border, y >= height - border
+    if not (left or right or top or bottom):
+        return None
+    on_side = left or right
+    on_end = top or bottom
+    vertical = ("n" if top or (on_side and y < corner)
+                else "s" if bottom or (on_side and y >= height - corner) else "")
+    horizontal = ("w" if left or (on_end and x < corner)
+                  else "e" if right or (on_end and x >= width - corner) else "")
+    return (vertical + horizontal) or None
 
 
 def stripe_color(text):
@@ -421,7 +444,8 @@ class PinClipApp:
         self._cards = []            # 畫面上卡片的順序（拖曳排序時會即時改變）
         self._wrap = 200
         self._drag = None           # 拖曳移動視窗
-        self._resize = None
+        self._resize_drag = None    # 正在縮放視窗：(邊, 按下的位置, 視窗原本的位置和大小)
+        self._edge_cursor = None    # 游標目前停在哪個縮放邊
         self._press_pos = None      # 按下卡片的位置；移動超過幾個像素才算拖曳
         self._drag_card = None      # 正在被拖曳排序的卡片
         self._autoscroll_job = None
@@ -429,7 +453,7 @@ class PinClipApp:
 
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         self.min_w, self.min_h = self.px(MIN_SIZE[0]), self.px(MIN_SIZE[1])
-        self._border = 1 if custom_frame else 0
+        self._border = self.px(EDGE) if custom_frame else 0
         self._make_fonts()
         self._make_styles()
 
@@ -449,6 +473,8 @@ class PinClipApp:
         root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build_ui()
+        if custom_frame:
+            self._bind_edges()
         self.apply_pin()
         self.refresh()
         if store.save_failed:
@@ -515,14 +541,11 @@ class PinClipApp:
 
         actions = tk.Frame(self.body, bg=BG)
         actions.pack(fill="x", padx=P(10), pady=(P(8), 0))
-        FlatButton(actions, "貼上並儲存", self.paste_and_save, fg=SECONDARY_FG, bg=SECONDARY,
-                   hover_bg=SECONDARY_HOVER, font=self.f_small_bold, padx=P(12),
-                   pady=P(5)).pack(side="left")
+        tk.Label(actions, text="Ctrl+Enter 也可以儲存", bg=BG, fg=MUTED,
+                 font=self.f_small).pack(side="left")
         FlatButton(actions, "儲存", self.save_input, fg=PRIMARY_FG, bg=PRIMARY,
                    hover_bg=PRIMARY_HOVER, font=self.f_small_bold, padx=P(18),
                    pady=P(5)).pack(side="right")
-        tk.Label(actions, text="Ctrl+Enter", bg=BG, fg=MUTED, font=self.f_small).pack(
-            side="right", padx=P(8))
 
         self.count = tk.Label(self.body, text="", bg=BG, fg=MUTED, font=self.f_small,
                               anchor="w")
@@ -590,9 +613,8 @@ class PinClipApp:
             i = self.px(i)
             self.grip.create_line(size, i, i, size, fill=HANDLE)
         self.grip.pack(side="right")
-        self.grip.bind("<ButtonPress-1>", self._resize_start)
-        self.grip.bind("<B1-Motion>", self._resize_move)
-        self.grip.bind("<ButtonRelease-1>", self._resize_end)
+        # 按下時開始縮放；之後的移動和放開由 _bind_edges 的視窗層級綁定處理
+        self.grip.bind("<ButtonPress-1>", lambda e: self._start_resize("se", e))
 
     def refresh(self):
         P = self.px
@@ -872,20 +894,89 @@ class PinClipApp:
         if self._drag:
             self.root.geometry(f"+{event.x_root - self._drag[0]}+{event.y_root - self._drag[1]}")
 
-    def _resize_start(self, event):
-        self._resize = (event.x_root, event.y_root, self.root.winfo_width(),
-                        self.root.winfo_height())
+    # ---- 拖曳邊框縮放視窗 --------------------------------------------------
 
-    def _resize_move(self, event):
-        if self._resize:
-            x0, y0, w0, h0 = self._resize
-            width = max(self.min_w, w0 + event.x_root - x0)
-            height = max(self.min_h, h0 + event.y_root - y0)
-            self.root.geometry(f"{width}x{height}")
+    def _bind_edges(self):
+        """沒有系統外框就沒有系統的縮放功能，自己做：滑過邊框變游標、按住拖曳縮放。
 
-    def _resize_end(self, _event):
-        self._resize = None
-        self._expanded_height = self.root.winfo_height()
+        邊框是視窗本身沒被內容蓋住的那一圈，所以事件的 widget 就是視窗本身；
+        子元件的事件也會經過這裡（視窗是它們的 bindtags 之一），要用 event.widget 分辨。
+        """
+        root = self.root
+        root.bind("<Motion>", self._edge_hover, add="+")
+        root.bind("<Leave>", self._edge_leave, add="+")
+        root.bind("<ButtonPress-1>", self._edge_press, add="+")
+        root.bind("<B1-Motion>", self._edge_motion, add="+")
+        root.bind("<ButtonRelease-1>", self._edge_release, add="+")
+
+    def _edge_zone(self, event):
+        if event.widget is not self.root:
+            return None
+        zone = edge_at(event.x, event.y, self.root.winfo_width(), self.root.winfo_height(),
+                       self._border, self.px(EDGE_CORNER))
+        if zone and self.collapsed:       # 縮小後高度固定，只能調寬度
+            zone = zone.replace("n", "").replace("s", "") or None
+        return zone
+
+    def _set_edge_cursor(self, zone):
+        if zone == self._edge_cursor:
+            return
+        self._edge_cursor = zone
+        if zone:
+            set_cursor(self.root, *RESIZE_CURSORS[zone])
+        else:
+            self.root.configure(cursor="")
+
+    def _edge_hover(self, event):
+        if self._resize_drag is None:
+            self._set_edge_cursor(self._edge_zone(event))
+
+    def _edge_leave(self, event):
+        if event.widget is self.root and self._resize_drag is None:
+            self._set_edge_cursor(None)
+
+    def _edge_press(self, event):
+        zone = self._edge_zone(event)
+        if zone:
+            self._start_resize(zone, event)
+
+    def _edge_motion(self, event):
+        if self._resize_drag is not None:
+            self._resize_to(event.x_root, event.y_root)
+
+    def _edge_release(self, _event):
+        if self._resize_drag is not None:
+            self._end_resize()
+
+    def _start_resize(self, zone, event):
+        root = self.root
+        self._resize_drag = (zone, event.x_root, event.y_root, root.winfo_x(), root.winfo_y(),
+                             root.winfo_width(), root.winfo_height())
+
+    def _resize_to(self, x_root, y_root):
+        zone, x0, y0, left, top, w0, h0 = self._resize_drag
+        dx, dy = x_root - x0, y_root - y0
+        root = self.root
+        width, height, x, y = w0, h0, left, top
+        if "e" in zone or "w" in zone:
+            width = w0 + dx if "e" in zone else w0 - dx
+            width = max(self.min_w, min(width, root.winfo_vrootwidth()))
+        if "s" in zone or "n" in zone:
+            height = h0 + dy if "s" in zone else h0 - dy
+            height = max(self.min_h, min(height, root.winfo_vrootheight()))
+        geometry = f"{width}x{height}"
+        if "w" in zone or "n" in zone:      # 從左邊或上邊拉：對面那條邊要留在原地，視窗位置跟著動
+            if "w" in zone:
+                x = left + w0 - width
+            if "n" in zone:
+                y = top + h0 - height
+            geometry += f"+{x}+{y}"
+        root.geometry(geometry)
+
+    def _end_resize(self):
+        self._resize_drag = None
+        if not self.collapsed:
+            self._expanded_height = self.root.winfo_height()
 
     def _show_in_taskbar(self):
         """無外框的視窗預設不會出現在工作列；Windows 上補回去，沒釘選又被蓋住時才找得回來。"""
@@ -915,14 +1006,6 @@ class PinClipApp:
         text = self.input.get("1.0", "end-1c")
         if self._add(text):
             self.input.delete("1.0", "end")
-
-    def paste_and_save(self):
-        try:
-            text = self.root.clipboard_get()
-        except tk.TclError:
-            self.set_status("剪貼簿裡沒有文字", "warn")
-            return
-        self._add(text)
 
     def _add(self, text):
         if not self.store.add(text):

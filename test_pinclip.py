@@ -12,8 +12,8 @@ pytest.importorskip("tkinter")
 import tkinter as tk
 
 import pinclip
-from pinclip import (Card, ClipStore, FlatButton, IconButton, PinClipApp, edge_scroll_step,
-                     fit_geometry, preview, stripe_color)
+from pinclip import (Card, ClipStore, FlatButton, IconButton, PinClipApp, edge_at,
+                     edge_scroll_step, fit_geometry, preview, stripe_color)
 
 
 # ---- 純邏輯 ----------------------------------------------------------------
@@ -295,20 +295,29 @@ def test_clicking_the_text_also_copies(app):
     assert app.root.clipboard_get() == "點文字也能複製"
 
 
-def test_paste_and_save_reads_clipboard_only_when_asked(app):
+def test_never_reads_the_system_clipboard_on_its_own(app):
+    """只保存你手動貼進輸入框的文字：程式本身從頭到尾都不會去讀系統剪貼簿。"""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("不應該讀剪貼簿")
+
     app.root.clipboard_clear()
     app.root.clipboard_append("從別處複製的")
+    app.root.clipboard_get = forbidden
+    app.root.selection_get = forbidden
     app.root.update()
     assert app.store.items == []                             # 光是剪貼簿有東西，不會自己進來
-    app.paste_and_save()
-    assert app.store.items == ["從別處複製的"]
+    app.input.insert("1.0", "手動貼的")
+    app.save_input()
+    app.copy("手動貼的")
+    app.delete("手動貼的")
+    app.refresh()
+    assert not hasattr(app, "paste_and_save")                # 沒有「貼上並儲存」
 
 
-def test_paste_and_save_with_empty_clipboard(app):
-    app.root.clipboard_clear()
-    app.paste_and_save()
-    assert app.store.items == []
-    assert "剪貼簿裡沒有文字" in app.status.cget("text")
+def test_save_row_has_only_the_save_button(app):
+    actions = [w for w in app.body.winfo_children() if isinstance(w, tk.Frame)][1]
+    buttons = [w.cget("text") for w in actions.winfo_children() if isinstance(w, FlatButton)]
+    assert buttons == ["儲存"]
 
 
 def test_delete_then_undo(app):
@@ -642,15 +651,172 @@ def test_resize_grip_resizes_and_respects_minimum(custom_app):
     app = custom_app
     app.root.geometry("400x500+50+50")
     app.root.update()
-    app._resize_start(event(x_root=450, y_root=550))
-    app._resize_move(event(x_root=500, y_root=600))
+    app._start_resize("se", event(x_root=450, y_root=550))
+    app._resize_to(500, 600)
     app.root.update()
     assert (app.root.winfo_width(), app.root.winfo_height()) == (450, 550)
-    app._resize_move(event(x_root=-9999, y_root=-9999))
+    assert (app.root.winfo_x(), app.root.winfo_y()) == (50, 50)             # 右下角：左上角不動
+    app._resize_to(-9999, -9999)
     app.root.update()
     assert (app.root.winfo_width(), app.root.winfo_height()) == (app.min_w, app.min_h)
-    app._resize_end(None)
+    app._end_resize()
     assert app._expanded_height == app.min_h
+
+
+# ---- 拖曳邊框縮放（自繪標題列才有）-------------------------------------------
+
+def shown_geometry(app):
+    app.root.update()
+    root = app.root
+    return root.winfo_x(), root.winfo_y(), root.winfo_width(), root.winfo_height()
+
+
+def press_edge(app, x, y):
+    """在視窗邊框上 (x, y) 按下滑鼠（x, y 是視窗內座標），回傳換算成螢幕座標的函式。"""
+    root = app.root
+    start_x, start_y = root.winfo_rootx() + x, root.winfo_rooty() + y      # 按下時的螢幕座標
+    root.event_generate("<ButtonPress-1>", x=x, y=y, rootx=start_x, rooty=start_y)
+
+    def drag_to(dx, dy):
+        """游標從按下的位置移動 (dx, dy)。視窗被拉動後座標會變，所以螢幕座標以按下時為準。"""
+        root.event_generate("<B1-Motion>", x=x + dx, y=y + dy, rootx=start_x + dx,
+                            rooty=start_y + dy)
+        root.update()
+    return drag_to
+
+
+def release(app):
+    app.root.event_generate("<ButtonRelease-1>", x=1, y=1)
+    app.root.update()
+
+
+@pytest.mark.parametrize("x, y, expected", [
+    (200, 250, None),                                    # 內容區
+    (2, 250, "w"), (397, 250, "e"), (200, 2, "n"), (200, 497, "s"),
+    (2, 2, "nw"), (397, 2, "ne"), (2, 497, "sw"), (397, 497, "se"),
+    (2, 10, "nw"), (10, 2, "nw"),                        # 邊上靠近角落的一段也算角落
+    (397, 490, "se"), (390, 497, "se"),
+    (2, 100, "w"), (100, 2, "n"),                        # 離角落夠遠就只是單邊
+    (5, 250, None), (200, 5, None),                      # 剛好在邊框外（邊框厚度 5）
+])
+def test_edge_at(x, y, expected):
+    assert edge_at(x, y, 400, 500, 5, 18) == expected
+
+
+def test_border_shows_resize_cursor_and_interior_resets_it(custom_app):
+    app = custom_app
+    root = app.root
+    root.event_generate("<Motion>", x=2, y=250)
+    assert root.cget("cursor") in ("size_we", "sb_h_double_arrow")
+    root.event_generate("<Motion>", x=2, y=2)
+    assert root.cget("cursor") in ("size_nw_se", "top_left_corner")
+    root.event_generate("<Motion>", x=200, y=250)
+    assert root.cget("cursor") == ""
+    app.header.event_generate("<Motion>", x=20, y=10)          # 在標題列（子元件）上也不留下縮放游標
+    assert root.cget("cursor") == ""
+
+
+def test_drag_left_edge_keeps_the_right_edge_in_place(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    x, y, w, h = shown_geometry(app)
+    drag_to = press_edge(app, 2, 250)
+    drag_to(-60, 0)
+    assert shown_geometry(app) == (x - 60, y, w + 60, h)       # 往左拉：變寬，右邊界不動
+    drag_to(40, 0)
+    assert shown_geometry(app) == (x + 40, y, w - 40, h)       # 往右推：變窄
+    release(app)
+    assert app._resize_drag is None
+
+
+def test_drag_right_and_bottom_edges(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, 398, 250)(50, 0)
+    assert shown_geometry(app) == (x, y, w + 50, h)
+    release(app)
+    press_edge(app, 200, 498)(0, 30)
+    assert shown_geometry(app)[2:] == (w + 50, h + 30)
+    release(app)
+    assert app._expanded_height == h + 30
+
+
+def test_drag_top_edge_keeps_the_bottom_edge_in_place(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, 200, 2)(0, -80)
+    assert shown_geometry(app) == (x, y - 80, w, h + 80)
+
+
+def test_drag_corners_resize_both_directions(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, 2, 2)(-30, -20)                            # 左上角
+    assert shown_geometry(app) == (x - 30, y - 20, w + 30, h + 20)
+    release(app)
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, w - 3, h - 3)(25, 15)                      # 右下角
+    assert shown_geometry(app) == (x, y, w + 25, h + 15)
+    release(app)
+
+
+def test_resizing_from_the_left_stops_at_the_minimum_without_moving_the_right_edge(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, 2, 250)(900, 0)                            # 一直往右推
+    nx, ny, nw, nh = shown_geometry(app)
+    assert nw == app.min_w and nx + nw == x + w                # 不能再窄，而且右邊界沒被推走
+    release(app)
+
+
+def test_collapsed_window_can_only_be_resized_horizontally(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    app.root.update()
+    app.collapse_button.invoke()
+    app.root.update()
+    x, y, w, h = shown_geometry(app)
+    press_edge(app, 200, app.root.winfo_height() - 2)(0, 80)   # 下邊：縮小時高度固定
+    assert shown_geometry(app) == (x, y, w, h)
+    release(app)
+    press_edge(app, app.root.winfo_width() - 2, 20)(40, 0)     # 右邊：可以調寬度
+    assert shown_geometry(app) == (x, y, w + 40, h)
+    release(app)
+    app.collapse_button.invoke()                               # 還原後高度仍是縮小前的
+    app.root.update()
+    assert app.root.winfo_height() == 500
+
+
+def test_pressing_inside_the_window_does_not_resize(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+200+100")
+    before = shown_geometry(app)
+    label_card = None
+    app.store.add("內容")
+    app.refresh()
+    app.root.update()
+    card = cards(app)[0]
+    card.event_generate("<ButtonPress-1>", x=3, y=3)           # 卡片上（不是視窗邊框）
+    app.root.event_generate("<B1-Motion>", x=3, y=3, rootx=700, rooty=700)
+    app.root.update()
+    assert shown_geometry(app) == before and app._resize_drag is None
+
+
+def test_native_frame_leaves_resizing_to_the_system(tmp_path):
+    native = build_app(tmp_path, False)
+    try:
+        native.root.geometry("400x500+200+100")
+        before = shown_geometry(native)
+        native.root.event_generate("<ButtonPress-1>", x=1, y=250)
+        native.root.event_generate("<B1-Motion>", x=1, y=250, rootx=100, rooty=250)
+        native.root.update()
+        assert shown_geometry(native) == before and native._border == 0
+    finally:
+        destroy(native)
 
 
 # ---- FlatButton --------------------------------------------------------------
