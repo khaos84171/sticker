@@ -2,6 +2,8 @@
 Linux 沒有螢幕時：xvfb-run -a python -m pytest
 """
 import json
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +12,7 @@ pytest.importorskip("tkinter")
 import tkinter as tk
 
 import pinclip
-from pinclip import ClipStore, PinClipApp, fit_geometry, preview
+from pinclip import Card, ClipStore, FlatButton, PinClipApp, fit_geometry, preview
 
 
 # ---- 純邏輯 ----------------------------------------------------------------
@@ -126,18 +128,30 @@ DUAL = (-1920, 0, 3840, 1080)       # 副螢幕在左邊，虛擬桌面從 -1920
     ("400x300+-1200+50", SCREEN, "400x300"),
     ("400x300+-1200+50", DUAL, "400x300+-1200+50"),     # 有副螢幕時，左邊的位置是合法的
     ("9999x9999+0+0", SCREEN, "1920x1080+0+0"),
-    ("10x10+0+0", SCREEN, "240x240+0+0"),
-    ("亂寫的", SCREEN, "360x480"),
-    (None, SCREEN, "360x480"),
+    ("10x10+0+0", SCREEN, "260x300+0+0"),
+    ("亂寫的", SCREEN, "360x520"),
+    (None, SCREEN, "360x520"),
 ])
 def test_fit_geometry(geometry, screen, expected):
     assert fit_geometry(geometry, *screen) == expected
 
 
+def test_custom_frame_choice(monkeypatch):
+    monkeypatch.delenv("PINCLIP_FRAME", raising=False)
+    monkeypatch.setattr(pinclip.sys, "platform", "win32")
+    assert pinclip.want_custom_frame() is True
+    monkeypatch.setattr(pinclip.sys, "platform", "linux")
+    assert pinclip.want_custom_frame() is False         # 其他系統的無外框視窗常拿不到鍵盤焦點
+    monkeypatch.setenv("PINCLIP_FRAME", "custom")
+    assert pinclip.want_custom_frame() is True
+    monkeypatch.setattr(pinclip.sys, "platform", "win32")
+    monkeypatch.setenv("PINCLIP_FRAME", "native")
+    assert pinclip.want_custom_frame() is False
+
+
 # ---- 介面 ------------------------------------------------------------------
 
-@pytest.fixture
-def app(tmp_path):
+def build_app(tmp_path, custom_frame):
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -151,27 +165,50 @@ def app(tmp_path):
         return real_attributes(*args)
 
     root.attributes = attributes
-    application = PinClipApp(root, ClipStore(tmp_path / "pinclip.json"))
+    application = PinClipApp(root, ClipStore(tmp_path / "pinclip.json"), custom_frame=custom_frame)
     application.topmost_calls = topmost_calls
     root.deiconify()
     root.update()
-    yield application
+    return application
+
+
+def destroy(app):
     try:
-        root.destroy()
+        app.root.destroy()
     except tk.TclError:
         pass
 
 
+@pytest.fixture(params=[False, True], ids=["native", "custom"])
+def app(request, tmp_path):
+    """系統外框和自繪標題列兩種都要測。"""
+    application = build_app(tmp_path, request.param)
+    yield application
+    destroy(application)
+
+
+@pytest.fixture
+def custom_app(tmp_path):
+    application = build_app(tmp_path, True)
+    yield application
+    destroy(application)
+
+
 def cards(app):
-    return [c for c in app.inner.winfo_children() if isinstance(c, tk.Frame)]
+    return [c for c in app.inner.winfo_children() if isinstance(c, Card)]
 
 
 def card_button(card, text):
-    return next(w for w in card.winfo_children() if isinstance(w, tk.Button) and w.cget("text") == text)
+    return next(w for w in card.winfo_children() if isinstance(w, FlatButton) and w.cget("text") == text)
+
+
+def event(**kwargs):
+    return SimpleNamespace(**kwargs)
 
 
 def test_starts_pinned_with_empty_hint(app):
     assert app.topmost_calls == [True]
+    assert app.pin_button.cget("text") == "已釘選"
     assert cards(app) == []
 
 
@@ -184,6 +221,7 @@ def test_typed_text_is_saved_with_ctrl_enter_and_input_clears(app):
     assert app.store.items == ["手動貼進來的字"]
     assert app.input.get("1.0", "end-1c") == ""          # 沒有多出換行、輸入框已清空
     assert len(cards(app)) == 1
+    assert "已儲存 1 筆" in app.count.cget("text")
 
 
 def test_empty_input_is_not_saved(app):
@@ -253,28 +291,160 @@ def test_new_item_scrolls_list_to_top_and_shows_first(app):
     assert cards(app)[0].winfo_children()[0].cget("text") == "最新的"
 
 
-def test_close_saves_window_state_and_unpinned_is_remembered(app, tmp_path):
-    app.pinned.set(False)
-    app.apply_pin()
-    assert app.topmost_calls == [True, False]
+def test_scrollbar_only_shows_when_list_overflows(app):
+    app.root.update()
+    assert not app.scroll.winfo_manager()
+    for i in range(30):
+        app.store.add(f"項目 {i}")
+    app.refresh()
+    app.root.update()
+    assert app.scroll.winfo_manager() == "place"
+
+
+def test_long_text_wraps_inside_the_card(app):
+    app.store.add("字" * 300)
+    app.refresh()
+    app.root.update()
+    card = cards(app)[0]
+    label = card.winfo_children()[0]
+    copy_button = card_button(card, "複製")
+    assert label.winfo_x() + label.winfo_reqwidth() <= copy_button.winfo_x()      # 文字不會被按鈕蓋住
+
+
+# ---- 釘選、縮小、關閉 -------------------------------------------------------
+
+def test_pin_button_toggles_topmost_and_label(app):
+    app.pin_button.invoke()
+    assert app.pinned is False and app.pin_button.cget("text") == "未釘選"
+    app.pin_button.invoke()
+    assert app.pinned is True and app.pin_button.cget("text") == "已釘選"
+    assert app.topmost_calls == [True, False, True]
+
+
+def test_collapse_shrinks_to_title_bar_and_restores(app):
+    before = app.root.winfo_height()
+    app.collapse_button.invoke()
+    app.root.update()
+    assert app.collapsed and not app.body.winfo_ismapped()
+    assert app.root.winfo_height() == app.header.winfo_reqheight() + 2 * app._border
+    assert app.collapse_button.cget("text") == "□"
+    app.collapse_button.invoke()
+    app.root.update()
+    assert not app.collapsed and app.body.winfo_ismapped()
+    assert app.root.winfo_height() == before
+    assert app.collapse_button.cget("text") == "—"
+
+
+def test_double_click_title_bar_collapses(app):
+    for _ in range(2):                  # Tk 不讓直接產生 Double 事件，連按兩次
+        app.header.event_generate("<ButtonPress-1>", x=5, y=5)
+        app.header.event_generate("<ButtonRelease-1>", x=5, y=5)
+    assert app.collapsed
+
+
+def test_closing_while_collapsed_remembers_the_full_height(app, tmp_path):
     app.root.geometry("333x444+20+30")
     app.root.update()
+    app.collapse_button.invoke()
+    app.root.update()
     app.close()
-    window = ClipStore(tmp_path / "pinclip.json").window
-    assert window["pinned"] is False
-    assert window["geometry"].startswith("333x444")
+    assert ClipStore(tmp_path / "pinclip.json").window["geometry"].startswith("333x444")
+
+
+def test_close_button_saves_state_and_closes_the_window(app, tmp_path):
+    app.store.add("留著")
+    app.pin_button.invoke()
+    app.root.geometry("333x444+20+30")
+    app.root.update()
+    app.close_button.invoke()
+    with pytest.raises(tk.TclError):
+        app.root.winfo_exists()
+    saved = ClipStore(tmp_path / "pinclip.json")
+    assert saved.items == ["留著"]
+    assert saved.window["pinned"] is False
+    assert saved.window["geometry"].startswith("333x444")
 
 
 def test_items_survive_restart(app, tmp_path):
     app.store.add("重開之後還在")
     app.close()
-    root = tk.Tk()
-    root.withdraw()
+    again = build_app(tmp_path, app.custom_frame)
     try:
-        again = PinClipApp(root, ClipStore(tmp_path / "pinclip.json"))
         assert [c.winfo_children()[0].cget("text") for c in cards(again)] == ["重開之後還在"]
     finally:
-        root.destroy()
+        destroy(again)
+
+
+# ---- 自繪標題列才有的：無外框、拖曳移動、右下角調整大小 ----------------------
+
+def test_custom_frame_is_borderless_and_native_is_not(tmp_path):
+    custom, native = build_app(tmp_path, True), build_app(tmp_path, False)
+    try:
+        assert custom.root.overrideredirect() and not native.root.overrideredirect()
+        assert hasattr(custom, "grip") and not hasattr(native, "grip")
+    finally:
+        destroy(custom)
+        destroy(native)
+
+
+def test_drag_title_bar_moves_window(custom_app):
+    root = custom_app.root
+    root.geometry("+100+100")
+    root.update()
+    custom_app._drag_start(event(x_root=150, y_root=110))
+    custom_app._drag_move(event(x_root=250, y_root=210))
+    root.update()
+    assert (root.winfo_x(), root.winfo_y()) == (200, 200)
+
+
+def test_resize_grip_resizes_and_respects_minimum(custom_app):
+    app = custom_app
+    app.root.geometry("400x500+50+50")
+    app.root.update()
+    app._resize_start(event(x_root=450, y_root=550))
+    app._resize_move(event(x_root=500, y_root=600))
+    app.root.update()
+    assert (app.root.winfo_width(), app.root.winfo_height()) == (450, 550)
+    app._resize_move(event(x_root=-9999, y_root=-9999))
+    app.root.update()
+    assert (app.root.winfo_width(), app.root.winfo_height()) == (app.min_w, app.min_h)
+    app._resize_end(None)
+    assert app._expanded_height == app.min_h
+
+
+# ---- FlatButton --------------------------------------------------------------
+
+def test_flat_button_fires_only_when_released_inside(app):
+    hits = []
+    button = FlatButton(app.root, "x", lambda: hits.append(1), fg="#000000", bg="#ffffff")
+    button.pack()
+    app.root.update()
+    button.event_generate("<ButtonRelease-1>", x=2, y=2)
+    assert hits == [1]
+    button.event_generate("<ButtonRelease-1>", x=-50, y=2)       # 按住後拖到按鈕外面再放開
+    assert hits == [1]
+
+
+def test_flat_button_flash_restores_text_and_colors(app):
+    button = FlatButton(app.root, "複製", lambda: None, fg="#111111", bg="#eeeeee",
+                        hover_fg="#222222", hover_bg="#dddddd")
+    button.flash("已複製 ✓", "#ffffff", "#009900", ms=10)
+    assert button.cget("text") == "已複製 ✓" and button.cget("bg") == "#009900"
+    time.sleep(0.05)
+    app.root.update()
+    assert button.cget("text") == "複製" and button.cget("bg") == "#eeeeee"
+
+
+def test_flash_after_the_card_was_rebuilt_does_not_error(app, tmp_path):
+    app.store.add("a")
+    app.refresh()
+    app.root.update()
+    button = card_button(cards(app)[0], "複製")
+    button.flash("已複製 ✓", "#ffffff", "#009900", ms=10)
+    app.refresh()                                         # 列表重建，按鈕被丟掉
+    time.sleep(0.05)
+    app.root.update()
+    assert not (tmp_path / "pinclip_error.log").exists()
 
 
 def test_callback_error_goes_to_log_file(app, tmp_path):
